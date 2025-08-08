@@ -1,4 +1,4 @@
-name: mspEN
+name: mspEN-dev
 
 channels:
   - conda-forge
