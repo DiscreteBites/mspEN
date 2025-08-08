@@ -7,18 +7,22 @@ setup(
 	author="Marcus Ng",
 	author_email="marcusngzhijie@gmail.com",
 	packages=find_packages(),
-	install_requires = [
-		'numpy>=1.26,<2.0; platform_system == "Linux"',
-		'scipy>=1.10,<1.14; platform_system == "Linux"',
-		'h5py>=3.10; platform_system == "Linux"',
-		'scikit-learn>=1.5,<1.6; platform_system == "Linux"',
-
-		'python-dotenv>=1.1.1',
-		'pandas>=2.3.1,<3.0.0',
-		'seaborn>=0.13.2,<0.14.0',
-		'bidict>=0.23.1',
-		'pyprojroot>=0.3.0',
-        'tqdm>=4.66.0'
+	install_requires=[
+		"numpy>=1.24",
+		"scipy>=1.10",
+		"pandas>=1.5",
+		"matplotlib>=3.7",
+		# Torch will be installed via the env.yml (CUDA 12.6 wheels).
 	],
+	extras_require={
+		"dev": [
+            "black", 
+            "ruff", 
+            "pytest",
+            "notebook", 
+            "ipykernel",
+            "pympler"
+        ],
+	},
 	python_requires=">=3.10,<3.12"
 )
