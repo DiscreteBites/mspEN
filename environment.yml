@@ -1,13 +1,17 @@
 name: mspEN
 
 channels:
-  - conda-forge
+  - pytorch
   - nvidia
+  - defaults
+
 dependencies:
   - python=3.10
   - pip
-  - cuda-version=12.6
-  - cuda-runtime=12.6.3
   - pip:
-      - torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126
       - -e .
+
+  # Linux: CUDA 12.6 build
+  - pytorch             # [linux]
+  - torchvision         # [linux]
+  - pytorch-cuda=12.6   # [linux]

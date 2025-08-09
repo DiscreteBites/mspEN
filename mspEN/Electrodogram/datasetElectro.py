@@ -5,11 +5,10 @@ from torch.utils.data import Dataset
 
 
 class ElectrodogramDataset(Dataset):
-    def __init__(self, data_dir, label_path, target_dim=(150, 100)):
+    def __init__(self, data_path, phoneme_path, indices_path, target_dim=(2, 100)):
         self.data_dir = data_dir
         self.target_dim = target_dim
-        print("loading labels...")
-
+        
         with open(label_path, "r") as f:
             _ = f.readline()
             self.label_name = f.readline().strip().split(" ")
@@ -18,7 +17,6 @@ class ElectrodogramDataset(Dataset):
             self.labels = []
         
         self.data_files = [os.path.join(data_dir, f"{idx+1:06}.npy") for idx, _ in self.labels]
-
 
     def __len__(self):
 
@@ -29,8 +27,6 @@ class ElectrodogramDataset(Dataset):
         label = self.labels[index][1]
 
         return data, label, mask
-
- 
 
     def _load_and_process_data(self, file_path, flip=False):
         data = np.load(file_path)
