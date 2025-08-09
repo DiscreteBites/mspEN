@@ -10,6 +10,11 @@ dependencies:
   - pip
   - pip:
       - -e .
+  
+  # Windows: CPU-only build
+  - pytorch             # [win]
+  - torchvision         # [win]
+  - cpuonly             # [win]
 
   # Linux: CUDA 12.6 build
   - pytorch             # [linux]

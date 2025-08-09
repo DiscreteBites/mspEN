@@ -12,7 +12,7 @@ setup(
 		"scipy>=1.10",
 		"pandas>=1.5",
 		"matplotlib>=3.7",
-		# Torch will be installed via the env.yml (CUDA 12.6 wheels).
+		# Torch will be installed via conda through environment.yml (CUDA 12.6 wheels).
 	],
 	extras_require={
 		"dev": [
