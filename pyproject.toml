@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mspEN"
+version = "0.1.0"
+description = "Implementing auto encoders + matrix subspace projection for electrodograms and neurograms"
+authors = [
+    { name = "Marcus Ng", email = "marcusngzhijie@gmail.com" }
+]
+readme="README.md"
+requires-python = ">=3.10,<3.12"
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "pandas>=1.5",
+    "matplotlib>=3.7"
+]
+
+[project.optional-dependencies]
+cpu = [
+    # PyTorch CPU
+    "torch==2.7.1",
+    "torchvision==0.22.1",
+    "torchaudio==2.7.1",
+]
+
+cuda = [
+    # PyTorch CUDA 12.6
+    'torch @ https://download.pytorch.org/whl/cu126',
+    'torchvision @ https://download.pytorch.org/whl/cu126',
+    'torchaudio @ https://download.pytorch.org/whl/cu126'
+]
+
+dev = [
+    "black",
+    "ruff",
+    "pytest",
+    "notebook",
+    "ipykernel",
+    "pympler"
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["mspEN*"]
