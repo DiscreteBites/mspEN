@@ -42,6 +42,9 @@ dev = [
     "pympler"
 ]
 
+[tool.setuptools]
+package-dir = {"" = "src"}
+
 [tool.setuptools.packages.find]
-where = ["src"]
-include = ["mspEN*"]
+where = [ "src" ]
+include = [ "mspEN", "mspEN.*" ]
