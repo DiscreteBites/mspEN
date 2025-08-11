@@ -1,9 +1,9 @@
-from .datasetNeuro import NeurogramDataset
-from .neuroAE import NeuroEncoder, NeuroDecoder
+from .dataset import make_loader
+from .autoencoder import NeurogramVAE
+from .train import trainAE
 
 __all__ = [
-    'NeurogramDataset',
-
-    'NeuroEncoder',
-    'NeuroDecoder'
+    'make_loader',
+    'NeurogramVAE',
+    'trainAE'
 ]

@@ -1,9 +1,9 @@
-from .datasetElectro import ElectrodogramDataset
-from .electroAE import ElectroEncoder, ElectroDecoder
+from .autoencoder import ElectroEncoder
+from .dataset import ElectrodogramDataset
+from .train import trainAE
 
 __all__ = [
     'ElectrodogramDataset',
-
     'ElectroEncoder',
-    'ElectroDecoder'
+    'trainAE'
 ]
