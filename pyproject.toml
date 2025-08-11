@@ -28,10 +28,13 @@ cpu = [
 ]
 
 cuda = [
-    # PyTorch CUDA 12.6
-    'torch @ https://download.pytorch.org/whl/cu126',
-    'torchvision @ https://download.pytorch.org/whl/cu126',
-    'torchaudio @ https://download.pytorch.org/whl/cu126'
+    # 
+    # !! Note that these pins are specific to the lws-gpu05 and lws-gpu06 servers !!
+    # 
+	# Linux x86_64
+	"https://download.pytorch.org/whl/cu126/torch-2.7.1%2Bcu126-cp37-cp37m-manylinux2014_x86_64.whl ; sys_platform == 'linux' and platform_machine == 'x86_64'",
+	"https://download.pytorch.org/whl/cu126/torchvision-0.22.1%2Bcu126-cp37-cp37m-manylinux2014_x86_64.whl ; sys_platform == 'linux' and platform_machine == 'x86_64'",
+	"https://download.pytorch.org/whl/cu126/torchaudio-2.7.1%2Bcu126-cp37-cp37m-manylinux2014_x86_64.whl ; sys_platform == 'linux' and platform_machine == 'x86_64'",
 ]
 
 dev = [
@@ -42,6 +45,7 @@ dev = [
     "ipykernel",
     "pympler"
 ]
+
 
 [tool.setuptools]
 package-dir = {"" = "src"}
