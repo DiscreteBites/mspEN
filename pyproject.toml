@@ -32,9 +32,9 @@ cuda = [
     # !! Note that these pins are specific to the lws-gpu05 and lws-gpu06 servers !!
     # 
 	# Linux x86_64
-	"https://download.pytorch.org/whl/cu126/torch-2.7.1%2Bcu126-cp37-cp37m-manylinux2014_x86_64.whl ; sys_platform == 'linux' and platform_machine == 'x86_64'",
-	"https://download.pytorch.org/whl/cu126/torchvision-0.22.1%2Bcu126-cp37-cp37m-manylinux2014_x86_64.whl ; sys_platform == 'linux' and platform_machine == 'x86_64'",
-	"https://download.pytorch.org/whl/cu126/torchaudio-2.7.1%2Bcu126-cp37-cp37m-manylinux2014_x86_64.whl ; sys_platform == 'linux' and platform_machine == 'x86_64'",
+	"torch @ https://download.pytorch.org/whl/cu126/torch-2.7.1%2Bcu126-cp37-cp37m-manylinux2014_x86_64.whl ; sys_platform == 'linux' and platform_machine == 'x86_64'",
+	"torchvision @ https://download.pytorch.org/whl/cu126/torchvision-0.22.1%2Bcu126-cp37-cp37m-manylinux2014_x86_64.whl ; sys_platform == 'linux' and platform_machine == 'x86_64'",
+	"torchaudio @ https://download.pytorch.org/whl/cu126/torchaudio-2.7.1%2Bcu126-cp37-cp37m-manylinux2014_x86_64.whl ; sys_platform == 'linux' and platform_machine == 'x86_64'",
 ]
 
 dev = [
