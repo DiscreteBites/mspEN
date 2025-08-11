@@ -17,24 +17,27 @@ dependencies = [
     "pandas>=1.5",
     "matplotlib>=3.7",
     "scikit-learn>=1.5,<1.6",
-]
-
-[project.optional-dependencies]
-cpu = [
-    # PyTorch CPU
     "torch==2.7.1",
     "torchvision==0.22.1",
     "torchaudio==2.7.1",
 ]
 
-cuda = [
-    # 
-    # !! Note that these pins are specific to the lws-gpu05 and lws-gpu06 servers !!
-    # 
-		"torch==2.7.1+cu126",
-	 "torchvision==0.22.1+cu126",
-	 "torchaudio==2.7.1+cu126",
-]
+[project.optional-dependencies]
+# cpu = [
+#     # PyTorch CPU
+#     "torch==2.7.1",
+#     "torchvision==0.22.1",
+#     "torchaudio==2.7.1",
+# ]
+
+# cuda = [
+#     # 
+#     # !! Note that these pins are specific to the lws-gpu05 and lws-gpu06 servers !!
+#     # 
+#     "torch==2.7.1+cu126",
+#     "torchvision==0.22.1+cu126",
+#     "torchaudio==2.7.1+cu126",
+# ]
 
 dev = [
     "black",
