@@ -6,22 +6,25 @@ from .autoencoder import NeurogramVAE
 from .dataset import make_loader
 
 def trainAE(
-    neurogram_path: str, phoneme_path: str, file_identifier_out: str = "neuro_vae_msp_best", 
-    epochs: int = 1
-) -> NeurogramVAE:
+    data_path: str, 
+    phoneme_path: str, 
+    file_identifier_out: str = "neuro_vae_msp_best", 
+    epochs: int = 80,
+    batch_size: int = 10
+):
     
     # --- setup
     torch.manual_seed(0)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("Training AE with device:", device)
-
+    
     # --- data
-    neurogram = np.load( neurogram_path )   # [N_time, F]
+    neurogram = np.load( data_path )   # [N_time, F]
     phonemes = np.load( phoneme_path )     # [N_time] in {0..39}
     T = 512
     ds, loader  = make_loader(
         neurogram, phonemes,
-        batch_size=8, T=T, hop=T,
+        batch_size=batch_size, T=T, hop=int(T/4),
         shuffle=True, num_workers=0, smooth_alpha=0.0
     )
     class_w = ds.class_weights(device)
@@ -37,7 +40,7 @@ def trainAE(
     ).to(device)
     opt = torch.optim.Adam(model.parameters(), lr=1e-3)
     scaler = torch.GradScaler(device='cuda', enabled=torch.cuda.is_available())
-
+    
     # --- train
     model.train()
     global_step = 0
@@ -87,6 +90,5 @@ def trainAE(
                 }, file_identifier_out + '.pt')
 
             global_step += 1
-
+    
     print("Done. Best loss:", best_loss)
-    return model

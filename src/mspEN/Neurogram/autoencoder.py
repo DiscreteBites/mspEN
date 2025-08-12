@@ -9,19 +9,16 @@ import torch.nn.functional as F
 class NeurogramEncoder(nn.Module):
     '''
     Encoder for neurograms shaped (B, C, T):
-    - Bands/channels C are treated as input channels
-    - Temporal Conv1d with stride=2 compresses time
-    - AdaptiveAvgPool1d -> time=1 gives a single feature vector per example
-    - Two linear heads output μ and log sigma^2  for the VAE latent
+
     '''
     
-    def __init__(self, n_bands: int = 150, n_features: int = 64, depth: int = 4, latent_dim: int = 256):
+    def __init__(self, nc: int = 150, nf: int = 64, depth: int = 6, latent_dim: int = 1024):
         super().__init__()
 
         layers = []
-        in_channels = n_bands
-        channels = n_features
-
+        in_channels = nc
+        channels = nf
+        
         for _ in range(depth):
             layers += [
                 nn.Conv1d(in_channels, channels, kernel_size=5, stride=2, padding=2, bias=False),
@@ -54,7 +51,7 @@ class NeurogramDecoder(nn.Module):
     - Deconvolution stack (stride=2) to expand time
     - Final layer outputs n_bands with Sigmoid (assuming inputs in [0,1])
     """
-    def __init__(self, n_bands: int, n_features: int = 64, depth: int = 4, latent_dim: int = 256, enc_out_ch: int = 512):
+    def __init__(self, n_bands: int, nf: int = 64, depth: int = 4, latent_dim: int = 256, enc_out_ch: int = 512):
         super().__init__()
 
         self.depth = depth
@@ -65,7 +62,7 @@ class NeurogramDecoder(nn.Module):
         chs = [enc_out_ch]
         channels = enc_out_ch
         for _ in range(depth - 1):
-            channels = max(channels // 2, n_features)
+            channels = max(channels // 2, nf)
             chs.append(channels)
         chs.append(n_bands)  # final out channels
 
@@ -116,21 +113,21 @@ class NeurogramVAE(nn.Module):
     """
     Full VAE for neurograms (B, C, T).
     - depth: # of stride-2 downsampling/upsampling stages
-    - n_features: base channels
+    - nf: base channels
     - latent_dim: size of latent vector
     - msp_label_size: if set, enables MSP-style latent-label alignment
     """
     def __init__(
         self,
         n_bands: int,
-        n_features: int = 64,
+        nf: int = 64,
         depth: int = 4,
         latent_dim: int = 256,
         msp_label_size: Optional[int] = None
     ):
         super().__init__()
-        self.enc = NeurogramEncoder(n_bands, n_features=n_features, depth=depth, latent_dim=latent_dim)
-        self.dec = NeurogramDecoder(n_bands, n_features=n_features, depth=depth, latent_dim=latent_dim, enc_out_ch=self.enc.out_channels)
+        self.enc = NeurogramEncoder(n_bands, nf=nf, depth=depth, latent_dim=latent_dim)
+        self.dec = NeurogramDecoder(n_bands, nf=nf, depth=depth, latent_dim=latent_dim, enc_out_ch=self.enc.out_channels)
         self.latent_dim = latent_dim
         self.n_bands = n_bands
         self.depth = depth
@@ -270,7 +267,7 @@ if __name__ == "__main__":
     torch.manual_seed(0)
 
     B, C, T = 4, 150, 512  # 500 Hz -> ~1.024 s at T=512
-    model = NeurogramVAE(n_bands=C, n_features=64, depth=4, latent_dim=256, msp_label_size=None)
+    model = NeurogramVAE(n_bands=C, nf=64, depth=4, latent_dim=256, msp_label_size=None)
     
     x = torch.rand(B, C, T)  # normalized neurograms in [0,1]
     recon, z, mu, logvar = model(x)
