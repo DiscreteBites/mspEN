@@ -1,37 +1,92 @@
 import numpy as np
 import torch
+from tqdm import tqdm
 
 from .autoencoder import NeurogramVAE
-from .dataset import make_loader  
+from .dataset import make_loader
 
-def trainAE( neurogram_path: str, phoneme_path: str ):    
-    C = 150
+def trainAE(
+    neurogram_path: str, phoneme_path: str, file_identifier_out: str = "neuro_vae_msp_best", 
+    epochs: int = 1
+) -> NeurogramVAE:
     
-    model = NeurogramVAE(n_bands=C, n_features=64, depth=4, latent_dim=256, msp_label_size=40)
+    # --- setup
+    torch.manual_seed(0)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print("Training AE with device:", device)
+
+    # --- data
+    neurogram = np.load( neurogram_path )   # [N_time, F]
+    phonemes = np.load( phoneme_path )     # [N_time] in {0..39}
+    T = 512
+    ds, loader  = make_loader(
+        neurogram, phonemes,
+        batch_size=8, T=T, hop=T,
+        shuffle=True, num_workers=0, smooth_alpha=0.0
+    )
+    class_w = ds.class_weights(device)
+
+    # --- model/optim
+    F = neurogram.shape[1]
+    model = NeurogramVAE(
+        n_bands=F,
+        n_features=64,     # was nf, now verbose
+        depth=4,
+        latent_dim=256,
+        msp_label_size=40
+    ).to(device)
     opt = torch.optim.Adam(model.parameters(), lr=1e-3)
-    
-    # data
-    neurogram = np.load( neurogram_path )   # shape [N_time, F]
-    phonemes = np.load( phoneme_path )    # shape [N_time], ints in {-1..39}
+    scaler = torch.GradScaler(device='cuda', enabled=torch.cuda.is_available())
 
-    # build loader
-    _, loader, _ = make_loader(neurogram, phonemes, batch_size=8, T=512, hop=512, min_labeled_ratio=0.6)
-
+    # --- train
     model.train()
-    for step, (x, y) in enumerate(loader):
+    global_step = 0
+    best_loss = float("inf")
 
-        # x: (B, F, T) ; y: (B, 40)
-        opt.zero_grad()
-        recon, z, mu, logvar = model(x)
+    for epoch in range(epochs):
+        epoch_bar = tqdm(loader, desc=f"Epoch {epoch+1}/{epochs}", leave=True)
+        for step, (x, y) in enumerate(epoch_bar):
+            x = x.to(device, non_blocking=True)   # (B, F, T)
+            y = y.to(device, non_blocking=True)   # (B, 40)
 
-        # total loss with MSP
-        L_rec = model.loss_recon(recon, x)
-        L_kl = model.loss_kl(mu, logvar)
-        weight = x.numel() / (y.numel() + z.numel())
-        L_msp = model.loss_msp(y, z) * weight
-        L = L_rec + L_kl + L_msp
-        L.backward()
-        opt.step()
+            opt.zero_grad(set_to_none=True)
+            with torch.autocast(
+                device_type='cuda', 
+                dtype=torch.float16, 
+                enabled=(device.type == 'cuda')
+            ):
+                L, stats = model.total_loss(
+                    x, labels=y,
+                    beta=1.0,
+                    lambda_msp=1.0,
+                    class_weights=class_w,
+                    scale_msp='auto',
+                    recon_reduction='sum'
+                )
 
-        if step % 50 == 0:
-            print(f"step {step}  total {L.item():.2f}  rec {L_rec.item():.2f}  kl {L_kl.item():.2f}  msp {L_msp.item():.2f}")
+            scaler.scale(L).backward()
+            scaler.step(opt)
+            scaler.update()
+
+            # update tqdm bar postfix
+            epoch_bar.set_postfix({
+                "total": f"{L.item():.2f}",
+                "rec": f"{stats['recon']:.2f}",
+                "kl": f"{stats['kl']:.2f}",
+                "msp": f"{stats['msp']:.2f}"
+            })
+
+            # save best (by total loss)
+            if L.item() < best_loss:
+                best_loss = L.item()
+                torch.save({
+                    "model": model.state_dict(),
+                    "opt": opt.state_dict(),
+                    "step": global_step,
+                    "epoch": epoch
+                }, file_identifier_out + '.pt')
+
+            global_step += 1
+
+    print("Done. Best loss:", best_loss)
+    return model
