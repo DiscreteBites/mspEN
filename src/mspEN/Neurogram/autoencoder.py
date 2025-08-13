@@ -9,7 +9,8 @@ import torch.nn.functional as F
 class NeurogramEncoder(nn.Module):
     '''
     Encoder for neurograms shaped (B, C, T):
-
+    - 6 layers of convolution in time
+    - (B, 150, T) -> (B, 64, T/2) -> (B, 128, T/4) -> (B, 256, T/8) -> (B, 512, T/16) -> (B, 1024, T/32)
     '''
     
     def __init__(self, nc: int = 150, nf: int = 64, depth: int = 6, latent_dim: int = 1024):
@@ -17,16 +18,16 @@ class NeurogramEncoder(nn.Module):
 
         layers = []
         in_channels = nc
-        channels = nf
+        out_channels = nf
         
         for _ in range(depth):
             layers += [
-                nn.Conv1d(in_channels, channels, kernel_size=5, stride=2, padding=2, bias=False),
-                nn.BatchNorm1d(channels),
+                nn.Conv1d(in_channels, out_channels, kernel_size=5, stride=2, padding=2, bias=False),
+                nn.BatchNorm1d(out_channels),
                 nn.LeakyReLU(0.2, inplace=True),
             ]
-            in_channels = channels
-            channels = min(channels * 2, 1024)  # cap capacity as time shrinks
+            in_channels = out_channels
+            out_channels = min(out_channels * 2, 1024)  # cap capacity as time shrinks
         
         self.backbone = nn.Sequential(*layers)
         self.out_channels = in_channels  # channels at the end of the conv stack
@@ -51,7 +52,7 @@ class NeurogramDecoder(nn.Module):
     - Deconvolution stack (stride=2) to expand time
     - Final layer outputs n_bands with Sigmoid (assuming inputs in [0,1])
     """
-    def __init__(self, n_bands: int, nf: int = 64, depth: int = 4, latent_dim: int = 256, enc_out_ch: int = 512):
+    def __init__(self, nc: int, nf: int = 64, depth: int = 6, latent_dim: int = 1024, enc_out_ch: int = 512):
         super().__init__()
 
         self.depth = depth
@@ -64,7 +65,7 @@ class NeurogramDecoder(nn.Module):
         for _ in range(depth - 1):
             channels = max(channels // 2, nf)
             chs.append(channels)
-        chs.append(n_bands)  # final out channels
+        chs.append(nc)  # final out channels
 
         ups = []
         for i in range(depth):
@@ -119,17 +120,17 @@ class NeurogramVAE(nn.Module):
     """
     def __init__(
         self,
-        n_bands: int,
+        nc: int = 150,
         nf: int = 64,
-        depth: int = 4,
-        latent_dim: int = 256,
+        depth: int = 6,
+        latent_dim: int = 1024,
         msp_label_size: Optional[int] = None
     ):
         super().__init__()
-        self.enc = NeurogramEncoder(n_bands, nf=nf, depth=depth, latent_dim=latent_dim)
-        self.dec = NeurogramDecoder(n_bands, nf=nf, depth=depth, latent_dim=latent_dim, enc_out_ch=self.enc.out_channels)
+        self.enc = NeurogramEncoder(nc, nf=nf, depth=depth, latent_dim=latent_dim)
+        self.dec = NeurogramDecoder(nc, nf=nf, depth=depth, latent_dim=latent_dim, enc_out_ch=self.enc.out_channels)
         self.latent_dim = latent_dim
-        self.n_bands = n_bands
+        self.n_bands = nc
         self.depth = depth
 
         self.M: Optional[torch.Tensor] = None
@@ -265,9 +266,9 @@ class NeurogramVAE(nn.Module):
 # -----------------------
 if __name__ == "__main__":
     torch.manual_seed(0)
-
-    B, C, T = 4, 150, 512  # 500 Hz -> ~1.024 s at T=512
-    model = NeurogramVAE(n_bands=C, nf=64, depth=4, latent_dim=256, msp_label_size=None)
+    
+    B, C, T = 4, 150, 128  # 500 Hz -> ~0.256 s at T=128
+    model = NeurogramVAE(nc=C, nf=64, depth=4, latent_dim=256, msp_label_size=None)
     
     x = torch.rand(B, C, T)  # normalized neurograms in [0,1]
     recon, z, mu, logvar = model(x)

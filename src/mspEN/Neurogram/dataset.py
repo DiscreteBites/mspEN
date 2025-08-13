@@ -9,11 +9,9 @@ class NeurogramDataset(Dataset):
     """
     Windows neurograms and phoneme IDs into (F, T) tensors and soft 40-D labels.
     - neurogram: np.ndarray [N_time, F]
-    - phonemes:  np.ndarray [N_time] with ints in {-1, 0..39}
+    - phonemes:  np.ndarray [N_time] with ints in {0..39}
     - T: window length (e.g., 512)
     - hop: step between windows (e.g., 512 for non-overlap, <512 for overlap)
-    - min_labeled_ratio: minimum fraction of frames (within the window) that are labeled (!= -1)
-    - normalize: if True, min-max normalize each window to [0,1] (per window); or pass a callable
     """
     def __init__(
         self,
@@ -22,7 +20,6 @@ class NeurogramDataset(Dataset):
         T: int = 512,
         hop: int = 512,
         n_attrs: int = 40,
-        normalize=True,
         smooth_alpha: float = 0.0,
         
         class_weight_mode: str | None = "balanced",     # "balanced"
@@ -30,6 +27,7 @@ class NeurogramDataset(Dataset):
 		class_weight_clip: float | None = None,
     ):
         assert neurogram.ndim == 2, "neurogram must be [N_time, F]"
+        assert np.all((neurogram >= 0) & (neurogram <= 1)), "neurograms are expected to be pre normalised"
         assert phonemes.ndim == 1, "phonemes must be [N_time]"
         assert not np.any(phonemes < 0), "unlabeled phonemes present"
         assert neurogram.shape[0] == phonemes.shape[0], "time alignment mismatch"
@@ -39,7 +37,6 @@ class NeurogramDataset(Dataset):
         self.T = int(T)
         self.hop = int(hop)
         self.n_attrs = int(n_attrs)
-        self.normalize = normalize
         self.smooth_alpha = float(smooth_alpha)
 
         # --- indices of valid windows
@@ -83,17 +80,7 @@ class NeurogramDataset(Dataset):
     def __len__(self):
         return len(self.indices)
 
-    def _normalize_window(self, x_win: np.ndarray) -> np.ndarray:
-        if callable(self.normalize):
-            return self.normalize(x_win)
-        if self.normalize is True:
-            xmin = x_win.min()
-            xmax = x_win.max()
-            den = max(xmax - xmin, 1e-6)
-            return (x_win - xmin) / den
-        return x_win
-
-    def _soft_label(self, p_win: np.ndarray) -> np.ndarray:
+    def _soft_label(self, p_win: NDArray) -> NDArray:
         # average one-hot over the window
         T = p_win.shape[0]
         counts = np.bincount(p_win, minlength=self.n_attrs).astype(np.float32)
@@ -101,6 +88,7 @@ class NeurogramDataset(Dataset):
 
         if self.smooth_alpha > 0.0:
             label = (1 - self.smooth_alpha) * label + self.smooth_alpha / self.n_attrs
+        
         return label
 
     def __getitem__(self, idx: int):
@@ -108,7 +96,6 @@ class NeurogramDataset(Dataset):
         x_win = self.neurogram[start:end]      # [T, F]
         p_win = self.phonemes[start:end]       # [T]
 
-        x_win = self._normalize_window(x_win)  # per-window [0,1] by default
         label = self._soft_label(p_win)        # [40], floats in [0,1]    
         
         # reshape to (F, T) for Conv1d (bands=channels)
@@ -125,9 +112,9 @@ class NeurogramDataset(Dataset):
 def make_loader(
     neurogram_np,
     phonemes_np,
-    batch_size=8,
-    T=512,
-    hop=512,
+    batch_size=20,
+    T=128,
+    hop=128/4,
     shuffle=True,
     num_workers=0,
     smooth_alpha=0.0,

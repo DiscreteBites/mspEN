@@ -8,11 +8,11 @@ from .dataset import make_loader
 def trainAE(
     data_path: str, 
     phoneme_path: str, 
-    file_identifier_out: str = "neuro_vae_msp_best", 
-    epochs: int = 80,
-    batch_size: int = 10
+    file_identifier_out: str = "neuro_vae_only", 
+    epochs: int = 100,
+    batch_size: int = 20
 ):
-    
+
     # --- setup
     torch.manual_seed(0)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -21,7 +21,7 @@ def trainAE(
     # --- data
     neurogram = np.load( data_path )   # [N_time, F]
     phonemes = np.load( phoneme_path )     # [N_time] in {0..39}
-    T = 512
+    T = 128
     ds, loader  = make_loader(
         neurogram, phonemes,
         batch_size=batch_size, T=T, hop=int(T/4),
@@ -32,11 +32,11 @@ def trainAE(
     # --- model/optim
     F = neurogram.shape[1]
     model = NeurogramVAE(
-        n_bands=F,
-        n_features=64,     # was nf, now verbose
-        depth=4,
-        latent_dim=256,
-        msp_label_size=40
+        nc=150,
+        nf=64,
+        depth=6,
+        latent_dim=1024,
+        msp_label_size=None
     ).to(device)
     opt = torch.optim.Adam(model.parameters(), lr=1e-3)
     scaler = torch.GradScaler(device='cuda', enabled=torch.cuda.is_available())
