@@ -30,7 +30,6 @@ def trainAE(
     class_w = ds.class_weights(device)
 
     # --- model/optim
-    F = neurogram.shape[1]
     model = NeurogramVAE(
         nc=150,
         nf=64,
@@ -51,7 +50,7 @@ def trainAE(
         for step, (x, y) in enumerate(epoch_bar):
             x = x.to(device, non_blocking=True)   # (B, F, T)
             y = y.to(device, non_blocking=True)   # (B, 40)
-
+            
             opt.zero_grad(set_to_none=True)
             with torch.autocast(
                 device_type='cuda', 
@@ -66,11 +65,11 @@ def trainAE(
                     scale_msp='auto',
                     recon_reduction='sum'
                 )
-
+            
             scaler.scale(L).backward()
             scaler.step(opt)
             scaler.update()
-
+            
             # update tqdm bar postfix
             epoch_bar.set_postfix({
                 "total": f"{L.item():.2f}",
@@ -78,7 +77,7 @@ def trainAE(
                 "kl": f"{stats['kl']:.2f}",
                 "msp": f"{stats['msp']:.2f}"
             })
-
+            
             # save best (by total loss)
             if L.item() < best_loss:
                 best_loss = L.item()

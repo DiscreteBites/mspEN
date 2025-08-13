@@ -5,15 +5,19 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-
 class NeurogramEncoder(nn.Module):
     '''
     Encoder for neurograms shaped (B, C, T):
     - 6 layers of convolution in time
-    - (B, 150, T) -> (B, 64, T/2) -> (B, 128, T/4) -> (B, 256, T/8) -> (B, 512, T/16) -> (B, 1024, T/32)
+    input: (N, 1,    150,  T   ) 
+        -> (N, 64,   64,   T/2 ) 
+        -> (N, 128,  128,  T/4 ) 
+        -> (N, 256,  256,  T/8 ) 
+        -> (N, 512,  512,  T/16) 
+        -> (N, 1024, 1024, T/32)
     '''
     
-    def __init__(self, nc: int = 150, nf: int = 64, depth: int = 6, latent_dim: int = 1024):
+    def __init__(self, nc: int = 1, nf: int = 64, depth: int = 6, latent_dim: int = 1024):
         super().__init__()
 
         layers = []
@@ -22,8 +26,8 @@ class NeurogramEncoder(nn.Module):
         
         for _ in range(depth):
             layers += [
-                nn.Conv1d(in_channels, out_channels, kernel_size=5, stride=2, padding=2, bias=False),
-                nn.BatchNorm1d(out_channels),
+                nn.Conv2d(in_channels, out_channels, kernel_size=5, stride=2, padding=2, bias=False),
+                nn.BatchNorm2d(out_channels),
                 nn.LeakyReLU(0.2, inplace=True),
             ]
             in_channels = out_channels
@@ -34,7 +38,7 @@ class NeurogramEncoder(nn.Module):
         self.pool = nn.AdaptiveAvgPool1d(1)
         self.mu = nn.Linear(self.out_channels, latent_dim)
         self.logvar = nn.Linear(self.out_channels, latent_dim)
-
+    
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
         # x: (B, F, T)
         h = self.backbone(x)              # (B, C, T')
@@ -43,6 +47,111 @@ class NeurogramEncoder(nn.Module):
         mu = self.mu(hg)                  # (B, H)
         logvar = self.logvar(hg)          # (B, H)
         return h, mu, logvar, Tp
+    
+    def layer_summary(self, X_shape):
+        X = torch.randn(*X_shape)
+        for layer in self.backbone:
+            X = layer(X)
+            print(layer.__class__.__name__, 'output shape:\t', X.shape)
+
+
+class TomaszEncoder(nn.Module):
+    '''
+    Encoder for neurograms shaped (B, C, T):
+    - 6 layers of convolution in time
+    input: (N, 1,    150,  T   ) 
+        -> (N, 64,   64,   T/2 ) 
+        -> (N, 128,  128,  T/4 ) 
+        -> (N, 256,  256,  T/8 ) 
+        -> (N, 512,  512,  T/16) 
+        -> (N, 1024, 1024, T/32)
+    '''
+    
+    def __init__(self, nc: int = 1, nf: int = 64, depth: int = 6, latent_dim: int = 1024):
+        super().__init__()
+    
+        self.backbone = nn.Sequential(
+            # Layer 1: Decrease spatial dimensions
+            nn.Conv2d(nc, nf, kernel_size=4, stride=2, padding=1, bias=False),
+            nn.LeakyReLU(0.2, inplace=True),
+
+            # Layer 2: Further decrease dimensions
+            nn.Conv2d(64, 128, kernel_size=4, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(128),
+            nn.LeakyReLU(0.2, inplace=True),
+        
+            # Layer 3: Downsample
+            nn.Conv2d(128, 256, kernel_size=4, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(256),
+            nn.LeakyReLU(0.2, inplace=True),
+
+            # Layer 4: Downsample
+            nn.Conv2d(256, 512, kernel_size=4, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(512),
+            nn.LeakyReLU(0.2, inplace=True),
+
+            # Layer 5: More downsampling
+            nn.Conv2d(512, 1024, kernel_size=4, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(1024),
+            nn.LeakyReLU(0.2, inplace=True),
+        
+            # Layer 6: Downsampling to target size
+            nn.Conv2d(1024, 1024, kernel_size=(4,3), stride=(1,1), padding=0, bias=False),
+        )
+
+        self.hidden_size = 1024 #latent level
+
+    def forward(self, input):
+        return self.backbone(input).squeeze(3).squeeze(2)
+    
+    def layer_summary(self, X_shape):
+        X = torch.randn(*X_shape)
+        for layer in self.backbone:
+            X = layer(X)
+            print(layer.__class__.__name__, 'output shape:\t', X.shape)
+
+class CalebEncoder(nn.Module):
+    '''
+    Encoder for neurograms shaped (B, C, T):
+    - 6 layers of convolution in time
+    input: (N, 1,    150,  T   ) 
+        -> (N, 64,   64,   T/2 ) 
+        -> (N, 128,  128,  T/4 ) 
+        -> (N, 256,  256,  T/8 ) 
+        -> (N, 512,  512,  T/16) 
+        -> (N, 1024, 1024, T/32)
+    '''
+    
+    def __init__(self, image_size = 256,  nf = 64, hidden_size=None, nc=3):
+        super().__init__()
+        self.image_size = image_size
+        self.hidden_size = hidden_size
+        sequens = [
+            nn.Conv2d(nc, nf, 4, 2, 1, bias=False),
+            nn.LeakyReLU(0.2, inplace=True),
+        ]
+        while(True):
+            image_size = image_size/2
+            if image_size > 4:
+                sequens.append(nn.Conv2d(nf, nf * 2, 4, 2, 1, bias=False))
+                sequens.append(nn.BatchNorm2d(nf * 2))
+                sequens.append(nn.LeakyReLU(0.2, inplace=True))
+                nf = nf * 2
+            else:
+                if hidden_size is None:
+                    self.hidden_size = int(nf)
+                sequens.append(nn.Conv2d(nf, self.hidden_size, int(image_size), 1, 0, bias=False))
+                break
+        self.main = nn.Sequential(*sequens)
+
+    def forward(self, input):
+        return self.main(input).squeeze(3).squeeze(2)
+    
+    def layer_summary(self, X_shape):
+        X = torch.randn(*X_shape)
+        for layer in self.main:
+            X = layer(X)
+            print(layer.__class__.__name__, 'output shape:\t', X.shape)
 
 
 class NeurogramDecoder(nn.Module):
@@ -120,15 +229,15 @@ class NeurogramVAE(nn.Module):
     """
     def __init__(
         self,
-        nc: int = 150,
+        nc: int = 1,
         nf: int = 64,
         depth: int = 6,
         latent_dim: int = 1024,
         msp_label_size: Optional[int] = None
     ):
         super().__init__()
-        self.enc = NeurogramEncoder(nc, nf=nf, depth=depth, latent_dim=latent_dim)
-        self.dec = NeurogramDecoder(nc, nf=nf, depth=depth, latent_dim=latent_dim, enc_out_ch=self.enc.out_channels)
+        self.enc = NeurogramEncoder(nc=nc, nf=nf, depth=depth, latent_dim=latent_dim)
+        self.dec = NeurogramDecoder(nc=nc, nf=nf, depth=depth, latent_dim=latent_dim, enc_out_ch=self.enc.out_channels)
         self.latent_dim = latent_dim
         self.n_bands = nc
         self.depth = depth

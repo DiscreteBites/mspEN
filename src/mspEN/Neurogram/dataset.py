@@ -15,8 +15,8 @@ class NeurogramDataset(Dataset):
     """
     def __init__(
         self,
-        neurogram: np.ndarray,          # [N_time, F]
-        phonemes: np.ndarray,           # [N_time] ints in {-1,0..39}
+        neurogram: NDArray,          # [N_time, F]
+        phonemes: NDArray,           # [N_time] ints in {-1,0..39}
         T: int = 512,
         hop: int = 512,
         n_attrs: int = 40,
@@ -114,7 +114,7 @@ def make_loader(
     phonemes_np,
     batch_size=20,
     T=128,
-    hop=128/4,
+    hop=int(128/4),
     shuffle=True,
     num_workers=0,
     smooth_alpha=0.0,
@@ -124,7 +124,7 @@ def make_loader(
 ):
     ds = NeurogramDataset(
         neurogram_np, phonemes_np,
-        T=T, hop=hop, normalize=True, smooth_alpha=smooth_alpha,
+        T=T, hop=hop, smooth_alpha=smooth_alpha,
         class_weight_mode=class_weight_mode,
         class_weight_normalize=class_weight_normalize,
         class_weight_clip=class_weight_clip,
