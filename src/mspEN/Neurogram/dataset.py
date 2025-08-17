@@ -1,138 +1,148 @@
+from __future__ import annotations
+from typing import Tuple, Sequence
+
 import numpy as np
 from numpy.typing import NDArray
+from pathlib import Path
 
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, Subset
 from sklearn.utils import compute_class_weight
+from sklearn.model_selection import train_test_split
+
+Indices = Sequence[Tuple[int, int]]
 
 class NeurogramDataset(Dataset):
     """
     Windows neurograms and phoneme IDs into (F, T) tensors and soft 40-D labels.
     - neurogram: np.ndarray [N_time, F]
-    - phonemes:  np.ndarray [N_time] with ints in {0..39}
-    - T: window length (e.g., 512)
-    - hop: step between windows (e.g., 512 for non-overlap, <512 for overlap)
+    - phoneme:  np.ndarray [N_time] with ints in {0..39}
+    - stream_idx: np.ndarray with indices to use
+    - time_dim: window length (e.g., 50)
+    - hop: step between windows or None for centered windows
     """
     def __init__(
         self,
-        neurogram: NDArray,          # [N_time, F]
-        phonemes: NDArray,           # [N_time] ints in {-1,0..39}
-        T: int = 512,
-        hop: int = 512,
+        neurogram:  NDArray[np.float32],          # [N_time, F]
+        phoneme: NDArray[np.int8],           # [N_time] ints in {0..39}
+        stream_idx: NDArray[np.int32] | None = None,
+
         n_attrs: int = 40,
-        smooth_alpha: float = 0.0,
-        
-        class_weight_mode: str | None = "balanced",     # "balanced"
-		class_weight_normalize: str | None = "mean",
-		class_weight_clip: float | None = None,
+        val_split: float = 0.2,
+        time_dim: int = 50,
+        hop: int | None = None
     ):
+        assert len(set(phoneme)) <= n_attrs, "got more phoneme than expected"
         assert neurogram.ndim == 2, "neurogram must be [N_time, F]"
         assert np.all((neurogram >= 0) & (neurogram <= 1)), "neurograms are expected to be pre normalised"
-        assert phonemes.ndim == 1, "phonemes must be [N_time]"
-        assert not np.any(phonemes < 0), "unlabeled phonemes present"
-        assert neurogram.shape[0] == phonemes.shape[0], "time alignment mismatch"
+        assert phoneme.ndim == 1, "phoneme must be [N_time]"
+        assert not np.any(phoneme < 0), "unlabeled phoneme present"
+        assert neurogram.shape[0] == phoneme.shape[0], "time alignment mismatch"
 
         self.neurogram = neurogram.astype(np.float32, copy=False)
-        self.phonemes = phonemes.astype(np.int64, copy=False)
-        self.T = int(T)
-        self.hop = int(hop)
-        self.n_attrs = int(n_attrs)
-        self.smooth_alpha = float(smooth_alpha)
+        self.phoneme = phoneme.astype(np.int8, copy=False)
+        self.stream_idx = stream_idx.astype(np.int32, copy=False) if stream_idx is not None else np.arange(phoneme.shape[0], dtype=np.int32)
 
-        # --- indices of valid windows
-        # window start/end indices (no labeled-ratio gate needed)
-        self.indices = [(s, s + self.T) for s in range(0, len(self.phonemes) - self.T + 1, self.hop)]
+        self.n_attrs = n_attrs
+        self.val_split = val_split
+        self.time_dim = int(time_dim)
+        self.hop = int(hop) if hop is not None else None
+        
+        # Compute centered phoneme
+        self.indices = self.get_centered_phonemes()
+        self.train_indices, self.val_indices = self.train_val_split()
+        
+    def train_val_split(self, seed=42) -> Tuple[Subset, Subset]:
+        labels = self.phoneme[[start for (start, _) in self.indices ]]
+        all_pos = np.arange(len(self.indices))
 
-        # --- global class weights over ALL labeled frames (ignoring -1)
-        self.class_weights_np = self._compute_class_weights(
-            mode=class_weight_mode,
-			normalize=class_weight_normalize,
-			clip=class_weight_clip
-        )
+        train, val = train_test_split(
+            all_pos,
+            test_size=self.val_split,
+            stratify= labels,
+            random_state=seed
+    )   
 
-    def _compute_class_weights(
-        self, 
-        mode: str | None, 
-        normalize: str | None,
-        clip: float | None
-    ) -> NDArray[np.float32]:
-    
-        if mode == "balanced":
-            w = compute_class_weight(
-                class_weight="balanced",
-                classes=np.arange(self.n_attrs),
-                y=self.phonemes
-            ).astype(np.float32)
+        return Subset(self, train.tolist()), Subset(self, val.tolist())
+
+    def get_centered_phonemes(self) -> Indices:
+        '''Get centered stable phoneme regions
+        '''
+
+        # Append -1 to the end so that the last element is a boundary end
+        deltas = np.ediff1d(self.phoneme[self.stream_idx], to_end=-1)
+        boundary_ends = self.stream_idx[deltas != 0]
+        boundary_starts = np.insert(boundary_ends[:-1]+1, 0, 0)
+
+        lengths = boundary_ends - boundary_starts +1
+        mask = lengths >= self.time_dim
+
+        left_win = int(np.floor((self.time_dim -1) / 2))
+        right_win = int(np.ceil((self.time_dim -1) / 2))
+        indices = []
+
+        if self.hop is None:
+            # centered indices
+            centers = np.floor((boundary_ends[mask] + boundary_starts[mask]) /2)
+            indices = [(int(c -left_win), int(c +right_win)) for c in centers]
         else:
-            w = np.ones(self.n_attrs, dtype=np.float32)
+            # rolling windows with hop
+            jumps = np.floor((lengths[mask] - self.time_dim) / self.hop).astype(int)
+            offsets = np.concatenate([np.arange(j + 1) * self.hop for j in jumps])
+            centers = np.repeat(boundary_starts[mask] + left_win, jumps + 1) + offsets
 
-        if normalize == "mean":
-            m = float(w.mean()) if w.size else 1.0
-            if m > 0:
-                w = w / m
-        
-        if (clip is not None) and (clip > 0):
-            w = np.minimum(w, float(clip))
-        
-        return w.astype(np.float32)
+            indices = [(int(c -left_win), int(c +right_win)) for c in centers]
 
+        return indices
 
     def __len__(self):
         return len(self.indices)
 
-    def _soft_label(self, p_win: NDArray) -> NDArray:
-        # average one-hot over the window
-        T = p_win.shape[0]
-        counts = np.bincount(p_win, minlength=self.n_attrs).astype(np.float32)
-        label = counts / float(T)
-
-        if self.smooth_alpha > 0.0:
-            label = (1 - self.smooth_alpha) * label + self.smooth_alpha / self.n_attrs
-        
-        return label
-
     def __getitem__(self, idx: int):
         start, end = self.indices[idx]
-        x_win = self.neurogram[start:end]      # [T, F]
-        p_win = self.phonemes[start:end]       # [T]
+        x_win = self.neurogram[start:end+1] # [T, 150]
+        phn_idx = self.phoneme[start]   # phoneme index
 
-        label = self._soft_label(p_win)        # [40], floats in [0,1]    
+        x = torch.from_numpy(x_win.T.copy()).unsqueeze(0) # (1, 150, T)
+        label = int(phn_idx)
+
+        return x, label
         
-        # reshape to (F, T) for Conv1d (bands=channels)
-        x = torch.from_numpy(x_win.T.copy())   # (F, T)
-        y = torch.from_numpy(label)            # (40,)
-
-        return x, y
-
-    def class_weights(self, device=None) -> torch.Tensor:
-        t = torch.from_numpy(self.class_weights_np)
-        return t.to(device) if device is not None else t
-
 
 def make_loader(
-    neurogram_np,
-    phonemes_np,
-    batch_size=20,
-    T=128,
-    hop=int(128/4),
-    shuffle=True,
-    num_workers=0,
-    smooth_alpha=0.0,
-    class_weight_mode: str | None= "balanced",
-	class_weight_normalize: str | None = "mean",
-	class_weight_clip: float | None = None,
+    neurogram_path: Path | str,
+    phoneme_path: Path | str,
+    stream_path: Path | str,
+    
+    n_attrs: int = 40,
+    val_split: float = 0.2,
+    time_dim: int =50,
+    hop: int | None = None,
+
+    batch_size: int =30,
+    shuffle: bool =True,
+    num_workers: int =0,
 ):
+    neurogram_np = np.load( neurogram_path )
+    phoneme_np = np.load( phoneme_path )
+    stream_np = np.load( stream_path )
+    
     ds = NeurogramDataset(
-        neurogram_np, phonemes_np,
-        T=T, hop=hop, smooth_alpha=smooth_alpha,
-        class_weight_mode=class_weight_mode,
-        class_weight_normalize=class_weight_normalize,
-        class_weight_clip=class_weight_clip,
+        neurogram_np, phoneme_np, stream_np,
+        n_attrs=n_attrs, val_split=val_split,
+        time_dim=time_dim, hop=hop
     )
 
-    loader = DataLoader(
-        ds, batch_size=batch_size, shuffle=shuffle,
+    train_ds, val_ds = ds.train_val_split()
+
+    train_loader = DataLoader(
+        train_ds, batch_size=batch_size, shuffle=shuffle,
         drop_last=False, num_workers=num_workers
     )
-    
-    return ds, loader
+
+    val_loader = DataLoader(
+        val_ds, batch_size=batch_size, shuffle=shuffle,
+        drop_last=False, num_workers=num_workers
+    )
+
+    return ds, train_loader, val_loader

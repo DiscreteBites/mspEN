@@ -1,154 +1,72 @@
-import math
-from typing import Optional, Tuple, Dict
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from mspEN.modules import VGGBlock, AdaptiveResize, InvVGGBlock, VAEType
+
 class NeurogramEncoder(nn.Module):
     '''
-    Encoder for neurograms shaped (B, C, T):
-    - 6 layers of convolution in time
-    input: (N, 1,    150,  T   ) 
-        -> (N, 64,   64,   T/2 ) 
-        -> (N, 128,  128,  T/4 ) 
-        -> (N, 256,  256,  T/8 ) 
-        -> (N, 512,  512,  T/16) 
-        -> (N, 1024, 1024, T/32)
+    Encoder that progressively reduces neurograms to 1024-dimensional latent space
+    
+    Architecture progression:
+    Input:  (batch, 1, 150, T)      # T ∈ {25, 50, 100, 200}
+    Stage1: (batch, 64, 150, T)     # Early spatiotemporal features [BatchNorm]
+    Stage2: (batch, 128, 75, T/2)   # Joint processing [BatchNorm] 
+    Stage3: (batch, 256, 25, T/4)   # Asymmetric spatial emphasis [Adaptive]
+    Stage4: (batch, 512, 5, T/8)    # High-level abstraction [Adaptive]
+    Stage5: (batch, 1024, 1, 1)     # Global compression [Adaptive]
     '''
     
-    def __init__(self, nc: int = 1, nf: int = 64, depth: int = 6, latent_dim: int = 1024):
+    def __init__(self, latent_dim: int = 1024, use_adaptive_norm: bool = True):
         super().__init__()
 
-        layers = []
-        in_channels = nc
-        out_channels = nf
+        self.latent_dim = latent_dim
+        self.use_adaptive_norm = use_adaptive_norm
+
+        def get_norm_type(stage):
+            if not use_adaptive_norm:
+                return 'batch'
+            return 'batch' if stage <= 2 else 'adaptive'
         
-        for _ in range(depth):
-            layers += [
-                nn.Conv2d(in_channels, out_channels, kernel_size=5, stride=2, padding=2, bias=False),
-                nn.BatchNorm2d(out_channels),
-                nn.LeakyReLU(0.2, inplace=True),
-            ]
-            in_channels = out_channels
-            out_channels = min(out_channels * 2, 1024)  # cap capacity as time shrinks
-        
-        self.backbone = nn.Sequential(*layers)
-        self.out_channels = in_channels  # channels at the end of the conv stack
-        self.pool = nn.AdaptiveAvgPool1d(1)
-        self.mu = nn.Linear(self.out_channels, latent_dim)
-        self.logvar = nn.Linear(self.out_channels, latent_dim)
-    
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
-        # x: (B, F, T)
-        h = self.backbone(x)              # (B, C, T')
-        Tp = h.shape[-1]                  # compressed time after strides
-        hg = self.pool(h).squeeze(-1)     # (B, C)
-        mu = self.mu(hg)                  # (B, H)
-        logvar = self.logvar(hg)          # (B, H)
-        return h, mu, logvar, Tp
-    
-    def layer_summary(self, X_shape):
-        X = torch.randn(*X_shape)
-        for layer in self.backbone:
-            X = layer(X)
-            print(layer.__class__.__name__, 'output shape:\t', X.shape)
+        self.main = nn.Sequential(
+            # Stage 1: Early spatiotemporal feature extraction
+            # 150×T → 150×T (preserve resolution, learn basic patterns)
+            VGGBlock(1, 64, kernel_size=(5, 3), padding=(2, 1), 
+                norm_type=get_norm_type(1), stride=1),
 
+            # Stage 2: Joint processing with first reduction  
+            # 150×T → 75×T/2 (moderate spatial reduction, begin temporal compression)
+            VGGBlock(64, 128, kernel_size=(3, 3), padding=1,
+                norm_type=get_norm_type(2), stride=1, pool_size=(2, 2)),
 
-class TomaszEncoder(nn.Module):
-    '''
-    Encoder for neurograms shaped (B, C, T):
-    - 6 layers of convolution in time
-    input: (N, 1,    150,  T   ) 
-        -> (N, 64,   64,   T/2 ) 
-        -> (N, 128,  128,  T/4 ) 
-        -> (N, 256,  256,  T/8 ) 
-        -> (N, 512,  512,  T/16) 
-        -> (N, 1024, 1024, T/32)
-    '''
-    
-    def __init__(self, nc: int = 1, nf: int = 64, depth: int = 6, latent_dim: int = 1024):
-        super().__init__()
-    
-        self.backbone = nn.Sequential(
-            # Layer 1: Decrease spatial dimensions
-            nn.Conv2d(nc, nf, kernel_size=4, stride=2, padding=1, bias=False),
-            nn.LeakyReLU(0.2, inplace=True),
-
-            # Layer 2: Further decrease dimensions
-            nn.Conv2d(64, 128, kernel_size=4, stride=2, padding=1, bias=False),
-            nn.BatchNorm2d(128),
-            nn.LeakyReLU(0.2, inplace=True),
-        
-            # Layer 3: Downsample
-            nn.Conv2d(128, 256, kernel_size=4, stride=2, padding=1, bias=False),
-            nn.BatchNorm2d(256),
-            nn.LeakyReLU(0.2, inplace=True),
-
-            # Layer 4: Downsample
-            nn.Conv2d(256, 512, kernel_size=4, stride=2, padding=1, bias=False),
-            nn.BatchNorm2d(512),
-            nn.LeakyReLU(0.2, inplace=True),
-
-            # Layer 5: More downsampling
-            nn.Conv2d(512, 1024, kernel_size=4, stride=2, padding=1, bias=False),
-            nn.BatchNorm2d(1024),
-            nn.LeakyReLU(0.2, inplace=True),
-        
-            # Layer 6: Downsampling to target size
-            nn.Conv2d(1024, 1024, kernel_size=(4,3), stride=(1,1), padding=0, bias=False),
+            # Stage 3: Asymmetric reduction with spatial emphasis
+            # 75×T/2 → 25×T/4 (aggressive spatial reduction)
+            VGGBlock(128, 256, kernel_size=(7, 3), padding=(3, 1),
+                    norm_type=get_norm_type(3), stride=(3, 2)),
+            # Stage 4: High-level abstraction
+            # 25×T/4 → 5×T/8 (continue aggressive spatial reduction)
+            VGGBlock(256, 512, kernel_size=(5, 3), padding=(2, 1),
+                    norm_type=get_norm_type(4), stride=(5, 2)),
+            
+            # Stage 5: Global compression 
+            # 5×T/8 → 1×1 (force global representation)
+            VGGBlock(512, 1024, kernel_size=(5, 3), padding=(2, 1),
+                    norm_type=get_norm_type(5), stride=(5, 2)),
+            
+            # Handle any remaining spatial/temporal dims
+            nn.AdaptiveAvgPool2d(1)
         )
 
-        self.hidden_size = 1024 #latent level
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (batch, 1, 150, 50) → neurogram input
+        features = self.main(x)  # → (batch, final_channels, 1, 1)
+        return features.squeeze(-1).squeeze(-1)
 
-    def forward(self, input):
-        return self.backbone(input).squeeze(3).squeeze(2)
-    
-    def layer_summary(self, X_shape):
+    def layer_summary(self, X_shape: Tuple[int, ...]):
         X = torch.randn(*X_shape)
-        for layer in self.backbone:
-            X = layer(X)
-            print(layer.__class__.__name__, 'output shape:\t', X.shape)
-
-class CalebEncoder(nn.Module):
-    '''
-    Encoder for neurograms shaped (B, C, T):
-    - 6 layers of convolution in time
-    input: (N, 1,    150,  T   ) 
-        -> (N, 64,   64,   T/2 ) 
-        -> (N, 128,  128,  T/4 ) 
-        -> (N, 256,  256,  T/8 ) 
-        -> (N, 512,  512,  T/16) 
-        -> (N, 1024, 1024, T/32)
-    '''
-    
-    def __init__(self, image_size = 256,  nf = 64, hidden_size=None, nc=3):
-        super().__init__()
-        self.image_size = image_size
-        self.hidden_size = hidden_size
-        sequens = [
-            nn.Conv2d(nc, nf, 4, 2, 1, bias=False),
-            nn.LeakyReLU(0.2, inplace=True),
-        ]
-        while(True):
-            image_size = image_size/2
-            if image_size > 4:
-                sequens.append(nn.Conv2d(nf, nf * 2, 4, 2, 1, bias=False))
-                sequens.append(nn.BatchNorm2d(nf * 2))
-                sequens.append(nn.LeakyReLU(0.2, inplace=True))
-                nf = nf * 2
-            else:
-                if hidden_size is None:
-                    self.hidden_size = int(nf)
-                sequens.append(nn.Conv2d(nf, self.hidden_size, int(image_size), 1, 0, bias=False))
-                break
-        self.main = nn.Sequential(*sequens)
-
-    def forward(self, input):
-        return self.main(input).squeeze(3).squeeze(2)
-    
-    def layer_summary(self, X_shape):
-        X = torch.randn(*X_shape)
+        print(f'Input tensor: {X.shape}')
         for layer in self.main:
             X = layer(X)
             print(layer.__class__.__name__, 'output shape:\t', X.shape)
@@ -156,243 +74,181 @@ class CalebEncoder(nn.Module):
 
 class NeurogramDecoder(nn.Module):
     """
-    Decoder mirrors the encoder with ConvTranspose1d:
-    - Latent z -> linear -> seed feature map (C_seed, 1)
-    - Deconvolution stack (stride=2) to expand time
-    - Final layer outputs n_bands with Sigmoid (assuming inputs in [0,1])
+    Decoder that reconstructs neurograms from 1024-dimensional latent space
+    
+    Architecture progression (reverse of encoder):
+    Start:  (batch, 1024, 1, 1)     # Reshape for 2D processing
+    Stage1: (batch, 512, 5, T/8)    # Initial spatial expansion [Adaptive]
+    Stage2: (batch, 256, 25, T/4)   # Regional reconstruction [Adaptive]
+    Stage3: (batch, 128, 75, T/2)   # Asymmetric expansion [Adaptive→Batch transition]
+    Stage4: (batch, 64, 150, T)     # Local feature reconstruction [BatchNorm]
+    Output: (batch, 1, 150, T)      # Final detail restoration [BatchNorm]
     """
-    def __init__(self, nc: int, nf: int = 64, depth: int = 6, latent_dim: int = 1024, enc_out_ch: int = 512):
+   
+    def __init__(self, latent_dim: int = 1024, target_time_dim: int = 50, use_adaptive_norm=True):
         super().__init__()
+        
+        self.latent_dim = latent_dim
+        self.target_time_dim = target_time_dim
+        
+        def get_norm_type(stage):
+            if not use_adaptive_norm:
+                return 'batch'
+            return 'adaptive' if stage <= 3 else 'batch'
+        
+        # Create the adaptive resize layer
+        self.adaptive_resize = AdaptiveResize(target_size=(150, target_time_dim))
 
-        self.depth = depth
-        self.seed_ch = enc_out_ch
-        self.latent_to_seed = nn.Linear(latent_dim, self.seed_ch)
+        # Sequential decoder with tensor size annotations
+        self.main = nn.Sequential(
+            # Stage 1: Initial spatial expansion
+            # 1×1 → 5×4 (begin spatial reconstruction)
+            InvVGGBlock(1024, 512, 
+                transpose_conv_params={'kernel_size': (5, 4), 'stride': 1, 'padding': 0},
+                norm_type=get_norm_type(1)
+            ),
+            
+            # Stage 2: Regional reconstruction 
+            # 5×4 → 25×T/4 (continue spatial expansion, handle temporal adaptively)
+            InvVGGBlock(512, 256,
+                upsample_factor=(5, 2),  # Approximate upsampling
+                norm_type=get_norm_type(2)
+            ),
+            
+            # Stage 3: Asymmetric expansion
+            # 25×T/4 → 75×T/2 (reverse encoder's asymmetric reduction)
+            InvVGGBlock(256, 128,
+                upsample_factor=(3, 2),
+                norm_type=get_norm_type(3)
+            ),
+            
+            # Stage 4: Local feature reconstruction
+            # 75×T/2 → 150×T (restore full spatial resolution)
+            InvVGGBlock(128, 64,
+                upsample_factor=(2, 2),
+                norm_type=get_norm_type(4)
+            ),
 
-        # Mirror channel flow (reverse)
-        chs = [enc_out_ch]
-        channels = enc_out_ch
-        for _ in range(depth - 1):
-            channels = max(channels // 2, nf)
-            chs.append(channels)
-        chs.append(nc)  # final out channels
+            # Adaptive resize to target temporal dimension
+            self.adaptive_resize,
 
-        ups = []
-        for i in range(depth):
-            in_channels = chs[i]
-            # for the last block, we jump directly to n_bands
-            out_channels = chs[i + 1] if i + 1 < len(chs) - 1 else chs[-1]
-            last = (i == depth - 1)
-            ups.append(
-                nn.ConvTranspose1d(in_channels, out_channels, kernel_size=5, stride=2, padding=2, output_padding=1, bias=False)
+            # Final layer: Detail restoration
+            # 150×T → 150×T (refine details, final output)
+            InvVGGBlock(64, 1,
+                kernel_size=(5, 3), padding=(2, 1),
+                norm_type=get_norm_type(5),
+                final_layer=True
             )
-            if not last:
-                ups += [nn.BatchNorm1d(out_channels), nn.ReLU(inplace=True)]
-        self.ups = nn.Sequential(*ups)
-        self.out_act = nn.Sigmoid()
+        )
 
-    def forward(self, z: torch.Tensor, T_target: int, T_seed: int) -> torch.Tensor:
-        # z: (B, H)
-        seed = self.latent_to_seed(z).unsqueeze(-1)  # (B, C_seed, 1)
+    def forward(self, z: torch.Tensor):
+        z = z.view(z.size(0), self.latent_dim, 1, 1)  # → (batch, initial_channels, 1, 1)
+        output = self.main(z)
+        return output
 
-        # Light learned upsampling to reach ~T_seed before the main stack.
-        # Use a simple nearest upsample repeatedly to the required length,
-        # then a 1x1 conv to mix channels back (kept simple here).
-        x = seed
-        while x.size(-1) < T_seed:
-            # double length (nearest) to approach T_seed
-            x = F.interpolate(x, scale_factor=2, mode="nearest")
-            if x.size(-1) > T_seed:
-                break
-        # Trim if we overshoot
-        if x.size(-1) > T_seed:
-            x = x[..., :T_seed]
+    def layer_summary(self, X_shape):
+        X = torch.randn(*X_shape)
+        print(f'Input tensor: {X.shape}')
+        for layer in self.main:
+            X = layer(X)
+            print(layer.__class__.__name__, 'output shape:\t', X.shape)
 
-        # Main upsampling stack
-        x = self.ups(x)
-
-        # Crop/pad to exactly T_target
-        if x.size(-1) > T_target:
-            x = x[..., :T_target]
-        elif x.size(-1) < T_target:
-            pad = T_target - x.size(-1)
-            x = F.pad(x, (0, pad))
-        return self.out_act(x)
-
-
-class NeurogramVAE(nn.Module):
+class NeurogramVAE(VAEType):
     """
     Full VAE for neurograms (B, C, T).
-    - depth: # of stride-2 downsampling/upsampling stages
-    - nf: base channels
-    - latent_dim: size of latent vector
-    - msp_label_size: if set, enables MSP-style latent-label alignment
-    """
-    def __init__(
-        self,
-        nc: int = 1,
-        nf: int = 64,
-        depth: int = 6,
-        latent_dim: int = 1024,
-        msp_label_size: Optional[int] = None
-    ):
+    """    
+    def __init__(self, latent_dim: int = 1024):
         super().__init__()
-        self.enc = NeurogramEncoder(nc=nc, nf=nf, depth=depth, latent_dim=latent_dim)
-        self.dec = NeurogramDecoder(nc=nc, nf=nf, depth=depth, latent_dim=latent_dim, enc_out_ch=self.enc.out_channels)
         self.latent_dim = latent_dim
-        self.n_bands = nc
-        self.depth = depth
 
-        self.M: Optional[torch.Tensor] = None
-        if msp_label_size is not None:
-            self.M = nn.Parameter(torch.empty(msp_label_size, latent_dim))
-            nn.init.xavier_normal_(self.M)
+        self.encoder = NeurogramEncoder(latent_dim = self.latent_dim)
+        self.decoder = NeurogramDecoder(latent_dim = self.latent_dim)
 
-    def encode(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
-        return self.enc(x)
+        # Intermediate mu and logvar latent parameters
+        self.fc1 = nn.Linear(self.latent_dim, self.latent_dim)
+        self.fc2 = nn.Linear(self.latent_dim, self.latent_dim)
+        
+    def encode(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        h = self.encoder(x)
+        mu = self.fc1(h)
+        logvar = self.fc2(h)
+        return mu, logvar
 
     @staticmethod
-    def reparameterize(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
-        std = torch.exp(0.5 * logvar)
+    def reparameterize(mu: torch.Tensor, logvar: torch.Tensor):
+        std = torch.exp(0.5*logvar)
         eps = torch.randn_like(std)
-        return mu + eps * std
+        return mu + eps*std
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        # Pad time to multiple of 2^depth so the stride-2 pyramid is clean
-        B, C, T = x.shape
-        factor = 2 ** self.depth
-        T_pad = math.ceil(T / factor) * factor
-        if T_pad != T:
-            xp = F.pad(x, (0, T_pad - T))
-        else:
-            xp = x
-
-        h, mu, logvar, Tp = self.encode(xp)
+        mu, logvar = self.encode(x)
         z = self.reparameterize(mu, logvar)
-        recon = self.dec(z, T_target=T, T_seed=Tp)  # crop back to original T
-        return recon, z, mu, logvar
+        prod = self.decoder(z)
+        return prod, z, mu, logvar
+    
+    @staticmethod
+    def _loss_vae(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
+        # https://arxiv.org/abs/1312.6114
+        # KLD = 0.5 * sum(1 + log(sigma^2) - mu^2 - sigma^2)
+        KLD = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+        return KLD
 
     @staticmethod
-    def loss_recon(pred: torch.Tensor, target: torch.Tensor, reduction: str = 'sum') -> torch.Tensor:
-        """
-        reduction: 'sum' (VAE-friendly default) or 'mean'
-        """
-        return F.mse_loss(pred, target, reduction=reduction)
-
-    @staticmethod
-    def loss_kl(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
-        return -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
-
-    def loss_msp(
-        self,
-        labels: torch.Tensor,                 # (B, 40) soft multi-labels in [0,1]
-        z: torch.Tensor,                      # (B, H)
-        class_weights: Optional[torch.Tensor] = None,  # (40,) or None
-        symmetric: bool = True
-    ) -> torch.Tensor:
-        """
-        Matrix Subspace Projection loss with optional per-class weighting.
-        - Label-space term: || z M^T - labels ||^2, weighted per class.
-        - Latent-space term: || labels M - z ||^2 (unweighted by default).
-        """
-        assert self.M is not None, "MSP requested but M not initialized"
-        pred_labels = z @ self.M.t()          # (B, 40)
-        if class_weights is not None:
-            # ensure shape (1, 40) for broadcast over batch
-            w = class_weights.view(1, -1).to(z.device, z.dtype)
-            L1 = ((pred_labels - labels) ** 2 * w).sum()
-        else:
-            L1 = F.mse_loss(pred_labels, labels, reduction="sum")
-        if symmetric:
-            L2 = F.mse_loss(labels @ self.M, z, reduction="sum")
-        else:
-            L2 = z.new_zeros(())
-        return L1 + L2
-
-    def total_loss(
-        self,
-        x: torch.Tensor,                      # (B, F, T)
-        labels: Optional[torch.Tensor] = None,# (B, 40) or None
-        beta: float = 1.0,
-        lambda_msp: float = 1.0,
-        class_weights: Optional[torch.Tensor] = None,  # (40,) or None
-        scale_msp: str = 'auto',              # 'auto' | 'none' | float
-        recon_reduction: str = 'sum'          # 'sum' | 'mean'
-    ) -> Tuple[torch.Tensor, Dict[str, float]]:
-        recon, z, mu, logvar = self.forward(x)
-
-        # core terms
-        L_rec = self.loss_recon(recon, x, reduction=recon_reduction)
-        L_kl = self.loss_kl(mu, logvar) * beta
-
-        # MSP (optional)
-        if (labels is not None) and (self.M is not None):
-            L_msp_raw = self.loss_msp(labels, z, class_weights=class_weights, symmetric=True)
-            # scale MSP to balance with reconstruction
-            if scale_msp == 'auto':
-                scale = x.numel() / (labels.numel() + z.numel())
-            elif scale_msp == 'none':
-                scale = 1.0
-            else:
-                # user-specified numeric scale
-                scale = float(scale_msp)
-            L_msp = lambda_msp * scale * L_msp_raw
-        else:
-            L_msp_raw = torch.tensor(0., device=x.device)
-            L_msp = torch.tensor(0., device=x.device)
-
-        L = L_rec + L_kl + L_msp
-        stats = {
-            "recon": float(L_rec.item()),
-            "kl": float(L_kl.item()),
-            "msp_raw": float(L_msp_raw.item()),
-            "msp": float(L_msp.item()),
-            "beta": float(beta),
-            "lambda_msp": float(lambda_msp)
-        }
-        return L, stats
+    def _loss_recon(predict: torch.Tensor, orig: torch.Tensor):
+        batch_size = predict.shape[0]
+        a = predict.view(batch_size, -1)
+        b = orig.view(batch_size, -1)
+        L = F.mse_loss(a, b, reduction='sum')
+        return L
     
-    def predict(self, x: torch.Tensor, new_ls: Optional[list] = None, weight: float = 1.0) -> torch.Tensor:
-        """
-        Optionally steer latent with target labels new_ls = [(idx, value), ...]
-        Returns a reconstructed neurogram with the steered latent.
-        """
-        recon, z, mu, logvar = self.forward(x)
-        if (new_ls is not None) and (self.M is not None):
-            zl = z @ self.M.t()
-            d = torch.zeros_like(zl)
-            for i, v in new_ls:
-                d[:, i] = v * weight - zl[:, i]
-            z = z + d @ self.M
-            # Re-decode with same T and T_seed estimate
-            B, C, T = x.shape
-            T_seed = max(1, T // (2 ** self.depth))
-            recon = self.dec(z, T_target=T, T_seed=T_seed)
-        return recon
+    def loss(self, predict: torch.Tensor, orig: torch.Tensor, mu: torch.Tensor, logvar: torch.Tensor):
+        l_recon = self._loss_recon(predict, orig)
+        l_vae = self._loss_vae(mu, logvar)
+        
+        Loss = l_recon + l_vae
+        return Loss, l_recon.item(), l_vae.item()
 
+    # def loss(self, 
+    #     predict: torch.Tensor, target: torch.Tensor, 
+    #     z: torch.Tensor, mu: torch.Tensor, logvar: torch.Tensor,
+    #     label: torch.Tensor | None
+    # ):
+    #     L_rec = self._loss_recon(predict, target)
+    #     L_vae = self._loss_vae(mu, logvar)
 
-# -----------------------
-# Minimal smoke test
-# -----------------------
-if __name__ == "__main__":
-    torch.manual_seed(0)
-    
-    B, C, T = 4, 150, 128  # 500 Hz -> ~0.256 s at T=128
-    model = NeurogramVAE(nc=C, nf=64, depth=4, latent_dim=256, msp_label_size=None)
-    
-    x = torch.rand(B, C, T)  # normalized neurograms in [0,1]
-    recon, z, mu, logvar = model(x)
-    print("Input shape :", x.shape)
-    print("Recon shape :", recon.shape)
-    print("Latent z    :", z.shape)
+    #     stats = {
+    #         'reconstruction loss': L_rec.item(),
+    #         'VAE loss': L_vae.item()
+    #     }
+        
+    #     if self.M is not None and label is not None:
+    #         L_msp = self._loss_msp(label, z)
+    #         _msp_weight = target.numel()/(label.numel()+z.numel())
 
-    L, stats = model.total_loss(x)
-    print("Loss (total):", float(L.item()))
-    print("Loss parts  :", stats)
+    #         Loss = L_rec + L_vae + L_msp * _msp_weight
+    #         stats['MSP loss'] = L_msp.item()
+    #         stats['MSP weight'] = _msp_weight
+    #     else:
+    #         Loss = L_rec + L_vae
+        
+    #     stats['total loss'] = Loss.item()
+    #     return Loss, stats
 
-    # Example training step (sketch)
-    # opt = torch.optim.Adam(model.parameters(), lr=1e-3)
-    # for step in range(1000):
-    # 	opt.zero_grad()
-    # 	L, _ = model.total_loss(x, beta=1.0)
-    # 	L.backward()
-    # 	opt.step()
+    # def acc(self, z, l):
+    #     zl = z @ self.M.t()
+    #     a = zl.clamp(-1, 1)*l*0.5+0.5
+    #     return a.round().mean().item()
+
+    # def predict(self, x, new_ls=None, weight=1.0):
+    #     z, _ = self.encode(x)
+    #     if new_ls is not None:
+    #         zl = z @ self.M.t()
+    #         d = torch.zeros_like(zl)
+    #         for i, v in new_ls:
+    #             d[:,i] = v*weight - zl[:,i]
+    #         z += d @ self.M
+    #     prod = self.decoder(z)
+    #     return prod
+
+    # def predict_ex(self, x, label, new_ls=None, weight=1.0):
+    #     return self.predict(x,new_ls,weight)
