@@ -1,5 +1,4 @@
 from typing import Optional, Tuple, Any, cast
-from collections import defaultdict
 
 import torch
 import torch.nn as nn
@@ -13,75 +12,122 @@ from pathlib import Path
 from tqdm import tqdm
 import json
 
-from mspEN.modules.types import VisualizeFnType, TrainingConfig, VAEType, DiscrType
+from mspEN.modules.hyperparameters import EarlyStopping
+from mspEN.modules.types import VisualizeFnType, TrainingConfig, VAEType, DiscrType, LossType
+from mspEN.modules.loss import AutomaticLossScaler
 from mspEN.msp import MSP
+from mspEN.utils import fmt_train_status, make_status_bar
 
 class mspVAETrainer:    
     def __init__(self,
         config: TrainingConfig,
         model_dir: Path,
-        vae_model: VAEType, vae_optimizer: optim.Optimizer,
+    
+        vae_model: VAEType, main_optimizer: optim.Optimizer,
         msp: Optional[MSP] = None,
         discriminators: dict[str, Tuple[DiscrType, optim.Optimizer]] = {},
+
+        addon_losses: dict[str, LossType] = {},
+        loss_scaling: str | None = None,
+        loss_scaling_kwargs: dict[str, Any] = {},
+        
         visualize_fn: Optional[VisualizeFnType] = None, 
         device: Optional[torch.device] = None,
-        scheduler: Optional[optim.lr_scheduler._LRScheduler] = None,
-        scheduler_monitor_loss: str = 'Total'
+
+        scheduler: Optional[optim.lr_scheduler.LRScheduler] = None,
+        scheduler_monitor_loss: str = 'Total',
+        early_stop: Optional[EarlyStopping] = None
     ):
         
         # ==================================
         # Initialise internals
         # ==================================
 
-        # Pull configs
         self.model_dir = model_dir
         self.config = config
         self.visualize_fn = visualize_fn
+                
+        # ==================================
+        # Setup Models
+        # ==================================
 
-        # Setup models
         self.vae_model = vae_model
-        self.vae_optimizer = vae_optimizer
+        self.main_optimizer = main_optimizer
         self.msp = msp
         self.discriminators = discriminators
-        self.scheduler = scheduler
-        self.scheduler_monitor_loss = scheduler_monitor_loss
 
-        # Device setup
+        # ==================================
+        # Setup Device
+        # ==================================
+
         self.device = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.vae_model.to(self.device)
         if self.msp is not None:
             self.msp.to(self.device)
         for name, (discr, opti) in self.discriminators.items():
             discr.to(self.device)
+
+        # Verify parameters on device
+        assert all(p.device.type == self.device.type for p in self.vae_model.parameters())
+        if self.msp is not None:
+            assert all(p.device.type == self.device.type for p in self.msp.parameters())
+        for name, (discr, opti) in self.discriminators.items():
+            assert all(p.device.type == self.device.type for p in discr.parameters())
+
+        # ==================================
+        # Setup losses
+        # ==================================
         
-        # Training state
-        self.epoch = 0
-        self.best_loss = float('inf')
-        self.train_losses: dict[str, list[float]] = {}
-        self.val_losses: dict[str, list[float]] = {}
-        
-        # Initialize loss store
-        self.loss_keys = ['Total', 'Recon', 'VAE']
+        self.addon_losses = addon_losses
+        self.loss_keys = ['Recon', 'VAE']
+        self.discriminator_loss_keys = []
         if self.msp is not None:
             self.loss_keys.append('MSP')
         for name, _ in self.discriminators.items():
-            self.loss_keys.append(f'Discriminator: {name}')
+            self.loss_keys.append(f'D:{name}')
+            self.discriminator_loss_keys.append(f'D_train:{name}')
+        for name, _ in self.addon_losses.items():
+            self.loss_keys.append(f'A:{name}')
+        
+        self.loss_scaler = AutomaticLossScaler(
+            self.loss_keys, method = loss_scaling,
+            **loss_scaling_kwargs
+        )
+        
+        # ==================================
+        # Setup hyperparameter control
+        # ==================================
+        
+        self.scheduler = scheduler
+        self.scheduler_monitor_loss = scheduler_monitor_loss
+        self.early_stop = early_stop
 
-        assert self.scheduler_monitor_loss in self.loss_keys, "Scheduling on unknown loss"
+        assert self.scheduler_monitor_loss  == 'Total' \
+            or self.scheduler_monitor_loss in self.loss_keys, "Scheduling on unknown loss"
 
-        # Initialize loss tracking dictionaries
-        for key in self.loss_keys:
-            self.train_losses[key] = []
-            self.val_losses[key] = []
-          
-        # Save config
+        # ==================================
+        # Initialise training state 
+        # ==================================
+
+        self.epoch = 0
+        self.best_loss = float('inf')
+        self.train_losses: dict[str, list[float]] = {
+            'Total': [],
+            **{key : [] for key in self.loss_keys},
+            **{key : [] for key in self.discriminator_loss_keys},
+        }
+        self.val_losses: dict[str, list[float]] = {
+            'Total': [],
+            **{key : [] for key in self.loss_keys}
+        }
+
+        # ==================================
+        # Save config and log status message
+        # ==================================
+
         config_dict = vars(config) if hasattr(config, '__dict__') else config
         with open(self.model_dir / 'config.json', 'w') as f:
             json.dump(config_dict, f, indent=2, default=str)
-        
-        # ==================================
-        # Log status message
-        # ==================================
 
         print(f"MSP VAE Trainer initialized:")
         print(f"  Device: {self.device}")
@@ -102,13 +148,19 @@ class mspVAETrainer:
         # Setup epoch loss tracking
         # =========================
 
-        epoch_loss: dict[str, float] = {k: 0.0 for k in self.loss_keys}
+        epoch_loss: dict[str, float] = {
+            'Total': 0.0,
+            **{key: 0.0 for key in self.loss_keys}
+        }
+        discriminator_loss: dict[str, float] = {key: 0.0 for key in self.discriminator_loss_keys}
         
         # =====================
         # Epoch loop
         # =====================
 
         pbar = tqdm(train_loader, desc=f'Epoch {self.epoch+1}/{getattr(self.config, "num_epochs", "?")}')
+        statusbar = make_status_bar()
+
         for batch_idx, (data, label) in enumerate(pbar):
             data = data.to(self.device)
             label = label.to(self.device)
@@ -118,7 +170,7 @@ class mspVAETrainer:
             # Forward pass of VAE
             # =====================
 
-            self.vae_optimizer.zero_grad()
+            self.main_optimizer.zero_grad()
             prod, z, mu, logvar = self.vae_model(data)
             
             # =========================
@@ -127,80 +179,83 @@ class mspVAETrainer:
 
             for name, (discr, opti) in self.discriminators.items():
                 opti.zero_grad()
-
+                
                 real = discr(data)
-                fake = discr(prod.detach())
                 loss_real = discr.loss(real, torch.ones_like(real))
-                loss_fake = discr.loss(fake, torch.zeros_like(fake))  # Fixed: should be zeros for fake
+
+                fake = discr(prod.detach())
+                loss_fake = discr.loss(fake, torch.zeros_like(fake))
+
                 discr_loss = loss_real + loss_fake
                 discr_loss.sum().backward()
-
+                
                 # Add gradient clipping for discriminators
                 if hasattr(self.config, 'disc_grad_clip_norm') and self.config.disc_grad_clip_norm > 0:
                     torch.nn.utils.clip_grad_norm_(discr.parameters(), self.config.disc_grad_clip_norm)
                 
                 opti.step()
-
+                discriminator_loss[f'D_train:{name}'] += discr_loss.item()
+                
             # ======================
             # Train VAE
             # ======================
+            
+            # Setup raw loss for auto scaling
+            raw_losses = {key: torch.zeros((), device=self.device) for key in self.loss_keys}
 
-            vae_loss, l_rec, l_vae = self.vae_model.loss(prod, data, mu, logvar)
+            # Get VAE reconstruction and KL losses
+            raw_losses['Recon'], raw_losses['VAE'] = self.vae_model.loss(prod, data, mu, logvar)
 
             # Get MSP loss
-            l_msp = torch.zeros((), device=self.device)
             if self.msp is not None:
-                l_msp = self.msp.loss(data, label, z)
-                
-            # Get discriminator loss for generator
-            Loss_discr = torch.zeros((), device=self.device)
+                raw_losses['MSP'] = self.msp.loss(data, label, z)
+            
+            # Get discriminator losses (fool the discriminator)
             for name, (discr, opti) in self.discriminators.items():
                 fake = discr(prod)
-                this_loss = discr.loss(fake, torch.ones_like(fake), False).sum()
-                epoch_loss[f'Discriminator: {name}'] += this_loss.item()
-                Loss_discr = Loss_discr + this_loss
-
-            # Train step
-            total_loss = vae_loss + l_msp + Loss_discr
-            total_loss.backward()
+                raw_losses[f'D:{name}'] = discr.loss(fake, torch.ones_like(fake), False).sum()
             
+            # Get addon losses
+            for name, loss_fn in self.addon_losses.items():
+                raw_losses[f'A:{name}'] = loss_fn(prod, data)
+            
+            # Train step
+            scaled_losses = self.loss_scaler(raw_losses)
+            total_loss = torch.stack(list(scaled_losses.values())).sum()
+            total_loss.backward()
+
             # Add gradient clipping for VAE
             if hasattr(self.config, 'grad_clip_norm') and self.config.grad_clip_norm > 0:
                 torch.nn.utils.clip_grad_norm_(self.vae_model.parameters(), self.config.grad_clip_norm)
             
-            self.vae_optimizer.step()
+            # Optimizer step
+            self.main_optimizer.step()
 
             # ======================
-            # Log epoch outs
+            # Track losses
             # ======================
-
+            
             # Track epoch losses
             epoch_loss['Total'] += total_loss.item()
-            epoch_loss['Recon'] += l_rec
-            epoch_loss['VAE'] += l_vae
-
-            if self.msp is not None:
-                epoch_loss['MSP'] += l_msp.item()
+            for key in self.loss_keys:
+                epoch_loss[key] += scaled_losses[key].item()
             
-            # Update progress bar
-            status_dict = {
-                'Loss': f'{total_loss.item() / batch_size:.4f}',
-                'Recon': f'{l_rec / batch_size:.4f}',
-                'KL': f'{l_vae / batch_size:.4f}',
-                'LR': f'{self.vae_optimizer.param_groups[0]["lr"]:.6f}'
-            }
+            # Update progress and status
+            statusbar.set_description_str(
+                fmt_train_status(total_loss, scaled_losses, batch_size, self.loss_keys)
+            )
+            pbar.set_postfix({'LR': f'{self.main_optimizer.param_groups[0]["lr"]:.6f}'})
             
-            if self.msp is not None:
-                status_dict['MSP Loss'] = f'{l_msp.item() / batch_size:.4f}'
-            
-            pbar.set_postfix(status_dict)
-        
+        statusbar.close()
         # Calculate average losses
         num_batches = len(train_loader)
         for key in epoch_loss:
             epoch_loss[key] /= num_batches
         
-        return epoch_loss
+        for key in discriminator_loss:
+            discriminator_loss[key] /= num_batches
+        
+        return epoch_loss, discriminator_loss
 
     def validate_epoch(self, val_loader: DataLoader[Tuple[Any, Any]]):
         """Validate for one epoch"""
@@ -209,7 +264,10 @@ class mspVAETrainer:
             discr.eval()
         
         # Setup validation loss tracking
-        val_epoch_loss: dict[str, float] = {k: 0.0 for k in self.loss_keys}
+        val_epoch_loss: dict[str, float] = {
+            'Total': 0.0,
+            **{key: 0.0 for key in self.loss_keys}
+        }
         
         with torch.no_grad():
             for batch_idx, (data, label) in enumerate(tqdm(val_loader, desc='Validation')):                    
@@ -221,50 +279,52 @@ class mspVAETrainer:
                 # =====================
                 prod, z, mu, logvar = self.vae_model(data)
                 
-                # Calculate VAE losses
-                vae_loss, l_rec, l_vae = self.vae_model.loss(prod, data, mu, logvar)
+                # Setup raw loss for auto scaling (matching training)
+                raw_losses = {key: torch.zeros((), device=self.device) for key in self.loss_keys}
+
+                # Get VAE reconstruction and KL losses
+                raw_losses['Recon'], raw_losses['VAE'] = self.vae_model.loss(prod, data, mu, logvar)
 
                 # Get MSP loss
-                l_msp = torch.zeros((), device=self.device)
                 if self.msp is not None:
-                    l_msp = self.msp.loss(data, label, z)
+                    raw_losses['MSP'] = self.msp.loss(data, label, z)
 
-                # Get discriminator losses
-                Loss_discr = torch.zeros((), device=self.device)
+                # Get discriminator losses (fool the discriminator)
                 for name, (discr, _) in self.discriminators.items():
-                    fake = discr(prod)
-                    this_loss = discr.loss(fake, torch.ones_like(fake), False).sum()
-                    val_epoch_loss[f'Discriminator: {name}'] += this_loss.item()
-                    Loss_discr = Loss_discr + this_loss
+                    fake_output = discr(prod)
+                    raw_losses[f'D:{name}'] = discr.loss(fake_output, torch.ones_like(fake_output), False).sum()
 
-                # Total loss
-                total_loss = vae_loss + l_msp + Loss_discr
+                # Get addon losses
+                for name, loss_fn in self.addon_losses.items():
+                    raw_losses[f'A:{name}'] = loss_fn(prod, data)
 
+                # Apply loss scaling
+                scaled_losses = self.loss_scaler(raw_losses)
+                total_loss = torch.stack(list(scaled_losses.values())).sum()
+                
                 # Track validation losses
                 val_epoch_loss['Total'] += total_loss.item()
-                val_epoch_loss['Recon'] += l_rec.item() if isinstance(l_rec, torch.Tensor) else l_rec
-                val_epoch_loss['VAE'] += l_vae.item() if isinstance(l_vae, torch.Tensor) else l_vae
-
-                if self.msp is not None:
-                    val_epoch_loss['MSP'] += l_msp.item()
-                
+                for key in self.loss_keys:
+                    val_epoch_loss[key] += scaled_losses[key].item()
+                    
         # Calculate average losses
         num_batches = len(val_loader)
         for key in val_epoch_loss:
             val_epoch_loss[key] /= num_batches
         
         return val_epoch_loss
-    
+        
     def save_checkpoint(self, is_best: bool = False, extra_data: Optional[dict] = None):
         """Save model checkpoint (config saved separately as JSON)"""
 
         # ===================================
         # Create and save checkpoint object
         # ===================================
+
         checkpoint = {
             'epoch': self.epoch,
             'vae_model_state_dict': self.vae_model.state_dict(),
-            'vae_optimizer_state_dict': self.vae_optimizer.state_dict(),
+            'vae_optimizer_state_dict': self.main_optimizer.state_dict(),
             'best_loss': self.best_loss,
             'train_losses': self.train_losses,
             'val_losses': self.val_losses,
@@ -278,9 +338,17 @@ class mspVAETrainer:
                 checkpoint['discriminator_state_dicts'][name] = discr.state_dict()
                 checkpoint['discriminator_optimizer_state_dicts'][name] = opti.state_dict()
         
+        # Add early stop state
+        if self.early_stop is not None:
+            checkpoint['early_stop_state_dict'] = self.early_stop.state_dict()
+
         # Add scheduler state
         if self.scheduler is not None:
             checkpoint['scheduler_state_dict'] = self.scheduler.state_dict()
+
+        # Add loss scaler state
+        if self.loss_scaler is not None:
+            checkpoint['loss_scaler_state_dict'] = self.loss_scaler.state_dict()
         
         # Add MSP state
         if self.msp is not None:
@@ -297,7 +365,9 @@ class mspVAETrainer:
         if is_best:
             torch.save(checkpoint, self.model_dir / 'best_checkpoint.pth')
 
-    def load_checkpoint(self, checkpoint_path: Path, load_optimizer: bool = True, load_scheduler: bool = True):
+    def load_checkpoint(self, 
+        checkpoint_path: Path, load_optimizer: bool = True, load_stopper: bool = True, load_scheduler: bool = True, load_loss_scaler: bool = True
+    ):
         """Load model checkpoint using safe context manager"""
         
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
@@ -318,7 +388,7 @@ class mspVAETrainer:
         self.vae_model.load_state_dict(checkpoint['vae_model_state_dict'])
         
         if load_optimizer and 'vae_optimizer_state_dict' in checkpoint:
-            self.vae_optimizer.load_state_dict(checkpoint['vae_optimizer_state_dict'])
+            self.main_optimizer.load_state_dict(checkpoint['vae_optimizer_state_dict'])
         
         # Load discriminator states
         if self.discriminators and 'discriminator_state_dicts' in checkpoint:
@@ -327,22 +397,39 @@ class mspVAETrainer:
                     discr.load_state_dict(checkpoint['discriminator_state_dicts'][name])
                 if load_optimizer and name in checkpoint.get('discriminator_optimizer_state_dicts', {}):
                     opti.load_state_dict(checkpoint['discriminator_optimizer_state_dicts'][name])
-        
-        if load_scheduler and self.scheduler and 'scheduler_state_dict' in checkpoint:
-            self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        
-        # Load MSP state
+
+        # Load MSP states
         if self.msp and 'msp_state_dict' in checkpoint:
             self.msp.load_state_dict(checkpoint['msp_state_dict'])
+        
+        # ========================
+        # Hyperparameter states
+        # =======================
 
+        if load_stopper and self.early_stop and 'early_stop_state_dict' in checkpoint:
+            self.early_stop.load_state_dict(checkpoint['early_stop_state_dict'])
+
+        if load_scheduler and self.scheduler and 'scheduler_state_dict' in checkpoint:
+            self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+
+        if load_loss_scaler and self.loss_scaler and 'loss_scaler_state_dict' in checkpoint:
+            self.loss_scaler.load_state_dict(checkpoint['loss_scaler_state_dict'])
+        
         # ==================================
         # Load loss / epoch history
         # ==================================
 
         self.epoch = checkpoint.get('epoch', 0)
         self.best_loss = checkpoint.get('best_loss', float('inf'))
-        self.train_losses = checkpoint.get('train_losses', {k: [] for k in self.loss_keys})
-        self.val_losses = checkpoint.get('val_losses', {k: [] for k in self.loss_keys})
+        self.train_losses = checkpoint.get('train_losses', {
+            'Total': [],
+            **{key : [] for key in self.loss_keys},
+            **{key : [] for key in self.discriminator_loss_keys},
+        })
+        self.val_losses = checkpoint.get('val_losses', {
+            'Total': [],
+            **{key : [] for key in self.loss_keys}
+        })
         
         return checkpoint
 
@@ -374,7 +461,7 @@ class mspVAETrainer:
             return
         
         # Create subplots based on number of loss components
-        num_plots = len(self.loss_keys)
+        num_plots = len(['Total', *self.loss_keys])
         cols = 3
         rows = (num_plots + cols - 1) // cols
         
@@ -385,7 +472,7 @@ class mspVAETrainer:
             axes = axes.reshape(-1, 1)
         
         plot_idx = 0
-        for key in self.loss_keys:
+        for key in ['Total', *self.loss_keys]:
             row = plot_idx // cols
             col = plot_idx % cols
             
@@ -432,16 +519,24 @@ class mspVAETrainer:
         for epoch in range(start_epoch, num_epochs):
             self.epoch = epoch
             
+            # ================================
+            # Update model hyperparameters
+            # =================================
+
+            self.vae_model.update_hyperparameters(epoch)
+            if self.msp is not None:
+                self.msp.update_hyperparameters(epoch)
+
             # ==================================
             # Train one epoch
             # ==================================
 
-            train_epoch_losses = self.train_epoch(train_loader)
+            train_epoch_losses, train_discriminator_losses = self.train_epoch(train_loader)
             
             # ==================================
             # Validate one epoch
             # ==================================
-
+            
             val_epoch_losses = {}
             if val_loader is not None:
                 val_epoch_losses = self.validate_epoch(val_loader)
@@ -450,26 +545,38 @@ class mspVAETrainer:
             # Scheduler update
             # ==================================
 
+            if self.early_stop:
+                loss_type = self.scheduler_monitor_loss
+                monitor_loss = val_epoch_losses.get(loss_type, train_epoch_losses[loss_type])
+                do_stop = self.early_stop(monitor_loss)
+                if do_stop:
+                    print(f"Early stopping triggered at epoch {epoch}")
+                    print(f"Status: {self.early_stop.get_status()}")
+                    break
+                
             if self.scheduler:
-                if hasattr(self.scheduler, 'step'):
-                      if 'ReduceLROnPlateau' in str(type(self.scheduler)):
-                        loss_type = self.scheduler_monitor_loss
-                        monitor_loss = val_epoch_losses.get(loss_type, train_epoch_losses[loss_type])
-                        cast(optim.lr_scheduler.ReduceLROnPlateau, self.scheduler).step(monitor_loss)
+                if self.config.scheduler_type == 'plateau':
+                    monitor_loss = val_epoch_losses.get(self.scheduler_monitor_loss, train_epoch_losses[self.scheduler_monitor_loss])
+                    cast(optim.lr_scheduler.ReduceLROnPlateau, self.scheduler).step(monitor_loss)
+                else:
+                    self.scheduler.step()
 
             # ==================================
             # Logging and storing losses
             # ==================================
 
-            for key in self.loss_keys:
+            for key in ['Total', *self.loss_keys]:
                 self.train_losses[key].append(train_epoch_losses[key])
                 if val_loader and key in val_epoch_losses:
                     self.val_losses[key].append(val_epoch_losses[key])
+
+            for key in self.discriminator_loss_keys:
+                self.train_losses[key].append(train_discriminator_losses[key])
             
             # ==================================
             # Save checkpoint
             # ==================================
-
+        
             current_loss = val_epoch_losses.get('Total', train_epoch_losses['Total'])
             is_best = current_loss < self.best_loss
             if is_best:

@@ -1,4 +1,5 @@
 from typing import Optional, Tuple
+from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -157,9 +158,10 @@ class NeurogramVAE(VAEType):
     """
     Full VAE for neurograms (B, C, T).
     """    
-    def __init__(self, latent_dim: int = 1024):
+    def __init__(self, latent_dim: int = 1024, beta_kld: float = 1):
         super().__init__()
         self.latent_dim = latent_dim
+        self.beta_kld = beta_kld
 
         self.encoder = NeurogramEncoder(latent_dim = self.latent_dim)
         self.decoder = NeurogramDecoder(latent_dim = self.latent_dim)
@@ -167,6 +169,9 @@ class NeurogramVAE(VAEType):
         # Intermediate mu and logvar latent parameters
         self.fc1 = nn.Linear(self.latent_dim, self.latent_dim)
         self.fc2 = nn.Linear(self.latent_dim, self.latent_dim)
+
+    def update_hyperparameters(self, epoch: int):
+        return
         
     def encode(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         h = self.encoder(x)
@@ -204,51 +209,4 @@ class NeurogramVAE(VAEType):
     def loss(self, predict: torch.Tensor, orig: torch.Tensor, mu: torch.Tensor, logvar: torch.Tensor):
         l_recon = self._loss_recon(predict, orig)
         l_vae = self._loss_vae(mu, logvar)
-        
-        Loss = l_recon + l_vae
-        return Loss, l_recon.item(), l_vae.item()
-
-    # def loss(self, 
-    #     predict: torch.Tensor, target: torch.Tensor, 
-    #     z: torch.Tensor, mu: torch.Tensor, logvar: torch.Tensor,
-    #     label: torch.Tensor | None
-    # ):
-    #     L_rec = self._loss_recon(predict, target)
-    #     L_vae = self._loss_vae(mu, logvar)
-
-    #     stats = {
-    #         'reconstruction loss': L_rec.item(),
-    #         'VAE loss': L_vae.item()
-    #     }
-        
-    #     if self.M is not None and label is not None:
-    #         L_msp = self._loss_msp(label, z)
-    #         _msp_weight = target.numel()/(label.numel()+z.numel())
-
-    #         Loss = L_rec + L_vae + L_msp * _msp_weight
-    #         stats['MSP loss'] = L_msp.item()
-    #         stats['MSP weight'] = _msp_weight
-    #     else:
-    #         Loss = L_rec + L_vae
-        
-    #     stats['total loss'] = Loss.item()
-    #     return Loss, stats
-
-    # def acc(self, z, l):
-    #     zl = z @ self.M.t()
-    #     a = zl.clamp(-1, 1)*l*0.5+0.5
-    #     return a.round().mean().item()
-
-    # def predict(self, x, new_ls=None, weight=1.0):
-    #     z, _ = self.encode(x)
-    #     if new_ls is not None:
-    #         zl = z @ self.M.t()
-    #         d = torch.zeros_like(zl)
-    #         for i, v in new_ls:
-    #             d[:,i] = v*weight - zl[:,i]
-    #         z += d @ self.M
-    #     prod = self.decoder(z)
-    #     return prod
-
-    # def predict_ex(self, x, label, new_ls=None, weight=1.0):
-    #     return self.predict(x,new_ls,weight)
+        return l_recon, self.beta_kld *  l_vae

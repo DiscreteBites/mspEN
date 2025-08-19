@@ -1,5 +1,5 @@
 from __future__ import annotations
-from typing import Tuple, Sequence
+from typing import Tuple, Sequence, Optional
 
 import numpy as np
 from numpy.typing import NDArray
@@ -26,11 +26,13 @@ class NeurogramDataset(Dataset):
         neurogram:  NDArray[np.float32],          # [N_time, F]
         phoneme: NDArray[np.int8],           # [N_time] ints in {0..39}
         stream_idx: NDArray[np.int32] | None = None,
+        
+        strategy: str = 'centered',
 
         n_attrs: int = 40,
         val_split: float = 0.2,
         time_dim: int = 50,
-        hop: int | None = None
+        hop: int | None = None,
     ):
         assert len(set(phoneme)) <= n_attrs, "got more phoneme than expected"
         assert neurogram.ndim == 2, "neurogram must be [N_time, F]"
@@ -48,52 +50,138 @@ class NeurogramDataset(Dataset):
         self.time_dim = int(time_dim)
         self.hop = int(hop) if hop is not None else None
         
-        # Compute centered phoneme
-        self.indices = self.get_centered_phonemes()
-        self.train_indices, self.val_indices = self.train_val_split()
+        # Compute phoneme windows
+        if strategy == 'naive':
+            self.indices = self._get_naive_window()
+        elif strategy == 'naive_rolling':
+            self.indices = self._get_rolling_window()
+        elif strategy == 'centered':
+            self.hop = None
+            self.indices = self._get_centered_window()
+        elif strategy == 'centered_rolling':
+            assert self.hop is not None, "centered rolling requires a hop size"
+            self.indices = self._get_centered_window()
+        else:
+            raise ValueError(f'Unknown windowing strategy {strategy}')
         
-    def train_val_split(self, seed=42) -> Tuple[Subset, Subset]:
+        self.train_indices, self.val_indices = self.train_val_split()
+    
+    def train_val_split(self, seed=42) -> Tuple[Optional[Subset], Optional[Subset]]:
         labels = self.phoneme[[start for (start, _) in self.indices ]]
         all_pos = np.arange(len(self.indices))
-
+        
+        if self.val_split == 0:
+            return Subset(self, all_pos.tolist()), None
+        
+        if self.val_split == 1:
+            return None, Subset(self, all_pos.tolist())
+        
         train, val = train_test_split(
             all_pos,
             test_size=self.val_split,
             stratify= labels,
             random_state=seed
-    )   
+        )      
 
         return Subset(self, train.tolist()), Subset(self, val.tolist())
 
-    def get_centered_phonemes(self) -> Indices:
-        '''Get centered stable phoneme regions
-        '''
+    def _get_naive_window(self) -> Indices:
+        self.hop = self.time_dim
+        step = int(self.hop)
+        
+        length = self.neurogram.shape[0]
+        max_start = length - self.time_dim
+        
+        if max_start < 0:
+            return []  # Not enough data for even one window
+        
+        return [(i, i + self.time_dim - 1) for i in range(0, max_start + 1, step)]  
+    
+    def _get_rolling_window(self) -> Indices:
+        assert self.hop is not None
+        # Greedy window build
+        windows: Indices = []
+        last = None
+        for idx in self.stream_idx:
+            if last is None or idx - last >= self.hop:
+                if idx - self.time_dim + 1 < 0:
+                    continue
+                
+                start = int(idx - self.time_dim + 1)
+                end = int(idx)  # inclusive
 
-        # Append -1 to the end so that the last element is a boundary end
-        deltas = np.ediff1d(self.phoneme[self.stream_idx], to_end=-1)
-        boundary_ends = self.stream_idx[deltas != 0]
-        boundary_starts = np.insert(boundary_ends[:-1]+1, 0, 0)
+                windows.append((start, end))
+                last = idx
 
-        lengths = boundary_ends - boundary_starts +1
-        mask = lengths >= self.time_dim
+        return windows
 
-        left_win = int(np.floor((self.time_dim -1) / 2))
-        right_win = int(np.ceil((self.time_dim -1) / 2))
-        indices = []
+    def _get_centered_window(self) -> Indices:
+        '''Work only in PURE stable phoneme regions as specified by stream index'''
+        length = self.neurogram.shape[0]
+        
+        valid = np.zeros(length, dtype=bool)
+        valid[self.stream_idx.astype(int)] = True
+
+        # detect run starts/ends (inclusive) within valid mask where phoneme stays constant
+        prev_valid = np.roll(valid, 1); prev_valid[0] = False
+        next_valid = np.roll(valid, -1); next_valid[-1] = False
+
+        prev_same = prev_valid & (self.phoneme == np.roll(self.phoneme, 1))
+        next_same = next_valid & (self.phoneme == np.roll(self.phoneme, -1))
+
+        starts = np.flatnonzero(valid & ~prev_same)
+        ends   = np.flatnonzero(valid & ~next_same)
+
+        assert starts.size == ends.size, "Mismatch between run starts and ends!"
+        # (rare) safety: realign if mismatch
+        # if starts.size != ends.size:
+        #     i = 0; s_list = []; e_list = []
+        #     while i < length:
+        #         while i < length and not valid[i]: i += 1
+        #         if i >= length: break
+        #         j = i + 1
+        #         p = self.phoneme[i]
+        #         while j < length and valid[j] and self.phoneme[j] == p: j += 1
+        #         s_list.append(i); e_list.append(j - 1); i = j
+        #     starts = np.asarray(s_list, dtype=int); ends = np.asarray(e_list, dtype=int)
+
+        L = ends - starts + 1
 
         if self.hop is None:
-            # centered indices
-            centers = np.floor((boundary_ends[mask] + boundary_starts[mask]) /2)
-            indices = [(int(c -left_win), int(c +right_win)) for c in centers]
-        else:
-            # rolling windows with hop
-            jumps = np.floor((lengths[mask] - self.time_dim) / self.hop).astype(int)
-            offsets = np.concatenate([np.arange(j + 1) * self.hop for j in jumps])
-            centers = np.repeat(boundary_starts[mask] + left_win, jumps + 1) + offsets
+            # keep only runs with length >= self.time_dim
+            long_mask = L >= self.time_dim
+            if not long_mask.any():
+                return []
 
-            indices = [(int(c -left_win), int(c +right_win)) for c in centers]
+            s = starts[long_mask]
+            e = ends[long_mask]
+            c = (s + e) // 2
 
-        return indices
+            st = np.maximum(s, c - self.time_dim // 2)
+            st = np.minimum(st, e - self.time_dim + 1)
+            st = np.maximum(st, s)
+            en = st + self.time_dim - 1
+
+            return list(map(tuple, np.stack([st, en], axis=1).astype(int)))
+
+        # hop is int: sliding windows
+        long_mask = L >= self.time_dim
+        if not long_mask.any():
+            return []
+
+        n_windows = 1 + (L[long_mask] - self.time_dim) // self.hop
+        total = int(n_windows.sum())
+
+        run_ids = np.repeat(np.nonzero(long_mask)[0], n_windows)
+
+        cum = np.cumsum(n_windows)
+        block_starts = np.repeat(cum - n_windows, n_windows)
+        pos_in_run = np.arange(total) - block_starts
+
+        win_starts = starts[run_ids] + pos_in_run * self.hop
+        win_ends   = win_starts + self.time_dim - 1
+        
+        return list(map(tuple, np.stack([win_starts, win_ends], axis=1).astype(int)))
 
     def __len__(self):
         return len(self.indices)
@@ -101,11 +189,10 @@ class NeurogramDataset(Dataset):
     def __getitem__(self, idx: int):
         start, end = self.indices[idx]
         x_win = self.neurogram[start:end+1] # [T, 150]
-        phn_idx = self.phoneme[start]   # phoneme index
-
+        p_win = self.phoneme[start:end+1] # phoneme index
+        
         x = torch.from_numpy(x_win.T.copy()).unsqueeze(0) # (1, 150, T)
-        label = int(phn_idx)
-
+        label = torch.from_numpy(p_win.copy())
         return x, label
         
 
@@ -114,35 +201,43 @@ def make_loader(
     phoneme_path: Path | str,
     stream_path: Path | str,
     
+    strategy: str  = 'centered',
+    
     n_attrs: int = 40,
     val_split: float = 0.2,
-    time_dim: int =50,
+    time_dim: int = 50,
     hop: int | None = None,
 
-    batch_size: int =30,
-    shuffle: bool =True,
-    num_workers: int =0,
-):
+    batch_size: int = 60,
+    shuffle: bool = True,
+    num_workers: int = 0,
+    
+) -> Tuple[NeurogramDataset, Optional[DataLoader], Optional[DataLoader]]:
     neurogram_np = np.load( neurogram_path )
     phoneme_np = np.load( phoneme_path )
     stream_np = np.load( stream_path )
     
     ds = NeurogramDataset(
         neurogram_np, phoneme_np, stream_np,
+        strategy=strategy,
         n_attrs=n_attrs, val_split=val_split,
         time_dim=time_dim, hop=hop
     )
 
     train_ds, val_ds = ds.train_val_split()
 
-    train_loader = DataLoader(
-        train_ds, batch_size=batch_size, shuffle=shuffle,
-        drop_last=False, num_workers=num_workers
-    )
-
-    val_loader = DataLoader(
-        val_ds, batch_size=batch_size, shuffle=shuffle,
-        drop_last=False, num_workers=num_workers
-    )
+    if train_ds is not None:
+        train_loader = DataLoader(
+            train_ds, batch_size=batch_size, shuffle=shuffle,
+            drop_last=False, num_workers=num_workers
+        )
+    else: train_loader = None
+    
+    if val_ds is not None:
+        val_loader = DataLoader(
+            val_ds, batch_size=batch_size, shuffle=shuffle,
+            drop_last=False, num_workers=num_workers
+        )
+    else: val_loader = None
 
     return ds, train_loader, val_loader

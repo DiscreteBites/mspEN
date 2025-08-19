@@ -2,14 +2,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-class SpatialPatchDiscriminator(nn.Module):
+from mspEN.modules.types import DiscrType
+
+class SpatialPatchDiscriminator(DiscrType):
     """
     Spatial discriminator focusing on current spread patterns across neuron bundles
-    
-    Inspired by PatchGAN but designed for neurogram spatial structure:
-    - Processes strips along the spatial dimension (neuron bundles)
-    - Outputs patch-wise real/fake decisions for different spatial regions
-    - Focuses on physiologically plausible current spread patterns
     """
     
     def __init__(self, input_channels=1, ndf=64):
@@ -41,29 +38,26 @@ class SpatialPatchDiscriminator(nn.Module):
             nn.Conv2d(ndf*8, 1, kernel_size=(3, 3), stride=1, padding=1),
             # → (batch, 1, 9, T) - patch predictions along spatial regions
         )
-    
+
     def forward(self, x):
         # x: (batch, 1, 150, T)
         patches = self.features(x)  # (batch, 1, 9, T)
         return patches  # Each spatial patch gets a real/fake score
     
-    def loss(self, pred, target, for_generator=True):
-        """PatchGAN-style loss"""
-        if for_generator:
-            # Generator wants all patches to be classified as real
+    def loss(self, pred, target, train_discriminator=True):
+        """Fixed PatchGAN-style loss"""
+        # pred: (batch, 1, 9, T), target: same shape
+        if not train_discriminator:
+            # Generator training: wants discriminator to think all patches are real
             target = torch.ones_like(pred)
+        # For discriminator training, target is passed in (real=1, fake=0)
         
-        return F.binary_cross_entropy_with_logits(pred, target)
+        return F.binary_cross_entropy_with_logits(pred, target, reduction='mean')
 
 
-class TemporalPatchDiscriminator(nn.Module):
+class TemporalPatchDiscriminator(DiscrType):
     """
     Temporal discriminator focusing on phoneme dynamics over time
-    
-    Designed for neurogram temporal structure:
-    - Processes strips along the temporal dimension
-    - Outputs patch-wise decisions for different time windows
-    - Focuses on realistic phoneme onset/offset patterns
     """
     
     def __init__(self, input_channels=1, ndf=64):
@@ -101,28 +95,26 @@ class TemporalPatchDiscriminator(nn.Module):
         patches = self.features(x)  # (batch, 1, 150, T/16)
         return patches  # Each temporal patch gets a real/fake score
     
-    def loss(self, pred, target, for_generator=True):
-        """PatchGAN-style loss"""
-        if for_generator:
+    def loss(self, pred, target, train_discriminator=True):
+        """Fixed PatchGAN-style loss"""
+        # pred: (batch, 1, 150, T/16), target: same shape
+        if not train_discriminator:
+            # Generator training: wants discriminator to think all patches are real
             target = torch.ones_like(pred)
+        # For discriminator training, target is passed in (real=1, fake=0)
         
-        return F.binary_cross_entropy_with_logits(pred, target)
+        return F.binary_cross_entropy_with_logits(pred, target, reduction='mean')
 
 
-class GlobalNeurogramDiscriminator(nn.Module):
+class GlobalNeurogramDiscriminator(DiscrType):
     """
-    Global discriminator for overall neurogram authenticity
-    
-    Similar to traditional PatchGAN but balanced spatial/temporal reduction:
-    - Processes entire neurogram holistically
-    - Outputs single real/fake decision for whole neurogram
-    - Ensures global coherence and structure
+    RECOMMENDED: Simplified global discriminator for overall neurogram authenticity
     """
     
     def __init__(self, input_channels=1, ndf=64):
         super().__init__()
         
-        # Balanced spatial/temporal reduction
+        # Simplified architecture - balanced spatial/temporal reduction
         self.features = nn.Sequential(
             # Input: (batch, 1, 150, T)
             nn.Conv2d(input_channels, ndf, kernel_size=(5, 5), stride=(2, 2), padding=(2, 2)),
@@ -139,15 +131,10 @@ class GlobalNeurogramDiscriminator(nn.Module):
             nn.LeakyReLU(0.2, inplace=True),
             # → (batch, 256, 18, T/8)
             
-            nn.Conv2d(ndf*4, ndf*8, kernel_size=(4, 4), stride=(2, 2), padding=(1, 1)),
-            nn.BatchNorm2d(ndf*8),
-            nn.LeakyReLU(0.2, inplace=True),
-            # → (batch, 512, 9, T/16)
-            
             # Global average pooling + final decision
             nn.AdaptiveAvgPool2d(1),
             nn.Flatten(),
-            nn.Linear(ndf*8, 1)
+            nn.Linear(ndf*4, 1)
         )
     
     def forward(self, x):
@@ -155,167 +142,118 @@ class GlobalNeurogramDiscriminator(nn.Module):
         decision = self.features(x)  # (batch, 1) - single real/fake score
         return decision
     
-    def loss(self, pred, target, for_generator=True):
-        """Standard binary classification loss"""
-        if for_generator:
+    def loss(self, pred, target, train_discriminator=True):
+        """Fixed standard binary classification loss"""
+        # pred: (batch, 1), target: (batch, 1)
+        if not train_discriminator:
+            # Generator training: wants discriminator to think samples are real
             target = torch.ones_like(pred)
+        # For discriminator training, target is passed in (real=1, fake=0)
         
-        return F.binary_cross_entropy_with_logits(pred, target)
+        return F.binary_cross_entropy_with_logits(pred, target, reduction='mean')
 
 
-class MultiScaleNeurogramDiscriminator(nn.Module):
+class BasicNeurogramDiscriminator(DiscrType):
     """
-    Multi-scale discriminator combining spatial, temporal, and global analysis
+    RECOMMENDED: Simple, effective discriminator for neurograms
     
-    Inspired by progressive GAN discriminators:
-    - Processes neurogram at multiple scales simultaneously
-    - Combines local and global authenticity decisions
-    - More robust than single-scale approaches
+    Key improvements:
+    - Fewer parameters, faster training
+    - Balanced spatial/temporal processing  
+    - Single output for simplicity
+    - Proven architecture patterns
     """
     
     def __init__(self, input_channels=1, ndf=32):
         super().__init__()
         
-        # Fine scale (full resolution)
-        self.fine_scale = nn.Sequential(
-            nn.Conv2d(input_channels, ndf, kernel_size=(3, 3), stride=1, padding=1),
-            nn.LeakyReLU(0.2),
-            nn.Conv2d(ndf, ndf*2, kernel_size=(3, 3), stride=(2, 2), padding=1),
+        self.features = nn.Sequential(
+            # Layer 1: Initial feature extraction
+            nn.Conv2d(input_channels, ndf, kernel_size=4, stride=2, padding=1),
+            nn.LeakyReLU(0.2, inplace=True),
+            # → (batch, 32, 75, T/2)
+            
+            # Layer 2: More features, batch norm
+            nn.Conv2d(ndf, ndf*2, kernel_size=4, stride=2, padding=1),
             nn.BatchNorm2d(ndf*2),
-            nn.LeakyReLU(0.2),
-        )
-        
-        # Medium scale (2x downsampled)
-        self.medium_scale = nn.Sequential(
-            nn.AvgPool2d(2),  # Downsample input
-            nn.Conv2d(input_channels, ndf, kernel_size=(3, 3), stride=1, padding=1),
-            nn.LeakyReLU(0.2),
-            nn.Conv2d(ndf, ndf*2, kernel_size=(3, 3), stride=(2, 2), padding=1),
-            nn.BatchNorm2d(ndf*2),
-            nn.LeakyReLU(0.2),
-        )
-        
-        # Coarse scale (4x downsampled)
-        self.coarse_scale = nn.Sequential(
-            nn.AvgPool2d(4),  # Downsample input
-            nn.Conv2d(input_channels, ndf, kernel_size=(3, 3), stride=1, padding=1),
-            nn.LeakyReLU(0.2),
-            nn.Conv2d(ndf, ndf*2, kernel_size=(3, 3), stride=(2, 2), padding=1),
-            nn.BatchNorm2d(ndf*2),
-            nn.LeakyReLU(0.2),
-        )
-        
-        # Fusion network
-        self.fusion = nn.Sequential(
-            nn.Conv2d(ndf*6, ndf*4, kernel_size=(3, 3), stride=(2, 2), padding=1),
+            nn.LeakyReLU(0.2, inplace=True),
+            # → (batch, 64, 37, T/4)
+            
+            # Layer 3: Higher level features
+            nn.Conv2d(ndf*2, ndf*4, kernel_size=4, stride=2, padding=1),
             nn.BatchNorm2d(ndf*4),
-            nn.LeakyReLU(0.2),
+            nn.LeakyReLU(0.2, inplace=True),
+            # → (batch, 128, 18, T/8)
+            
+            # Layer 4: Final feature compression
+            nn.Conv2d(ndf*4, ndf*8, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm2d(ndf*8),
+            nn.LeakyReLU(0.2, inplace=True),
+            # → (batch, 256, 9, T/16)
+            
+            # Global pooling and classification
             nn.AdaptiveAvgPool2d(1),
             nn.Flatten(),
-            nn.Linear(ndf*4, 1)
+            nn.Linear(ndf*8, 1)
         )
     
     def forward(self, x):
-        # Process at multiple scales
-        fine_features = self.fine_scale(x)
-        medium_features = self.medium_scale(x)
-        coarse_features = self.coarse_scale(x)
-        
-        # Upsample to common size for fusion
-        target_size = fine_features.shape[2:]
-        medium_up = F.interpolate(medium_features, size=target_size, mode='bilinear', align_corners=False)
-        coarse_up = F.interpolate(coarse_features, size=target_size, mode='bilinear', align_corners=False)
-        
-        # Fuse multi-scale features
-        combined = torch.cat([fine_features, medium_up, coarse_up], dim=1)
-        decision = self.fusion(combined)
-        
-        return decision
+        return self.features(x)
     
-    def loss(self, pred, target, for_generator=True):
-        """Standard binary classification loss"""
-        if for_generator:
+    def loss(self, pred, target, train_discriminator=True):
+        """Simple, correct loss function"""
+        if not train_discriminator:
+            # Generator wants to fool discriminator (all real)
             target = torch.ones_like(pred)
         
-        return F.binary_cross_entropy_with_logits(pred, target)
+        return F.binary_cross_entropy_with_logits(pred, target, reduction='mean')
 
 
-# Factory function for easy experimentation
-def create_neurogram_discriminator(discriminator_type='spatial', **kwargs):
+# Alternative: Spectral normalization version for training stability
+class SpectralNormDiscriminator(DiscrType):
     """
-    Factory function to create different discriminator types
-    
-    Args:
-        discriminator_type: 'spatial', 'temporal', 'global', 'multiscale'
-        **kwargs: Additional arguments passed to discriminator constructor
+    ALTERNATIVE: Discriminator with spectral normalization for stability
     """
-    discriminators = {
-        'spatial': SpatialPatchDiscriminator,
-        'temporal': TemporalPatchDiscriminator,
-        'global': GlobalNeurogramDiscriminator,
-        'multiscale': MultiScaleNeurogramDiscriminator
-    }
     
-    if discriminator_type not in discriminators:
-        raise ValueError(f"Unknown discriminator type: {discriminator_type}")
+    def __init__(self, input_channels=1, ndf=32):
+        super().__init__()
+        
+        self.features = nn.Sequential(
+            # Layer 1
+            nn.utils.spectral_norm(
+                nn.Conv2d(input_channels, ndf, kernel_size=4, stride=2, padding=1)
+            ),
+            nn.LeakyReLU(0.2, inplace=True),
+            
+            # Layer 2
+            nn.utils.spectral_norm(
+                nn.Conv2d(ndf, ndf*2, kernel_size=4, stride=2, padding=1)
+            ),
+            nn.LeakyReLU(0.2, inplace=True),
+            
+            # Layer 3
+            nn.utils.spectral_norm(
+                nn.Conv2d(ndf*2, ndf*4, kernel_size=4, stride=2, padding=1)
+            ),
+            nn.LeakyReLU(0.2, inplace=True),
+            
+            # Layer 4
+            nn.utils.spectral_norm(
+                nn.Conv2d(ndf*4, ndf*8, kernel_size=4, stride=2, padding=1)
+            ),
+            nn.LeakyReLU(0.2, inplace=True),
+            
+            # Final layer
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.utils.spectral_norm(nn.Linear(ndf*8, 1))
+        )
     
-    return discriminators[discriminator_type](**kwargs)
-
-
-# Example usage and testing
-if __name__ == "__main__":
-    # Test all discriminator types
-    batch_size = 4
-    input_tensor = torch.randn(batch_size, 1, 150, 50)  # Neurogram batch
+    def forward(self, x):
+        return self.features(x)
     
-    discriminator_types = ['spatial', 'temporal', 'global', 'multiscale']
-    
-    for disc_type in discriminator_types:
-        print(f"\nTesting {disc_type} discriminator:")
+    def loss(self, pred, target, train_discriminator=True):
+        if not train_discriminator:
+            target = torch.ones_like(pred)
         
-        # Create discriminator
-        discriminator = create_neurogram_discriminator(disc_type)
-        
-        # Forward pass
-        output = discriminator(input_tensor)
-        
-        # Test loss
-        real_loss = discriminator.loss(output, torch.ones_like(output), for_generator=False)
-        gen_loss = discriminator.loss(output, torch.ones_like(output), for_generator=True)
-        
-        print(f"  Input shape: {input_tensor.shape}")
-        print(f"  Output shape: {output.shape}")
-        print(f"  Real loss: {real_loss.item():.4f}")
-        print(f"  Generator loss: {gen_loss.item():.4f}")
-        print(f"  Parameters: {sum(p.numel() for p in discriminator.parameters()):,}")
-
-# Usage in your trainer:
-"""
-# Single discriminator
-spatial_disc = create_neurogram_discriminator('spatial')
-spatial_opt = torch.optim.Adam(spatial_disc.parameters(), lr=2e-4)
-
-trainer = mspVAETrainer(
-    config=config,
-    vae_model=vae_model,
-    vae_optimizer=vae_optimizer,
-    discriminators={'spatial': (spatial_disc, spatial_opt)}
-)
-
-# Multiple discriminators
-discriminators = {
-    'spatial': (create_neurogram_discriminator('spatial'), 
-                torch.optim.Adam(spatial_disc.parameters(), lr=2e-4)),
-    'temporal': (create_neurogram_discriminator('temporal'),
-                 torch.optim.Adam(temporal_disc.parameters(), lr=2e-4)),
-    'global': (create_neurogram_discriminator('global'),
-               torch.optim.Adam(global_disc.parameters(), lr=1e-4))
-}
-
-trainer = mspVAETrainer(
-    config=config,
-    vae_model=vae_model,
-    vae_optimizer=vae_optimizer,
-    discriminators=discriminators
-)
-"""
+        return F.binary_cross_entropy_with_logits(pred, target, reduction='mean')

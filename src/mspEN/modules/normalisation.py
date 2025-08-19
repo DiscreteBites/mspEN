@@ -2,6 +2,48 @@
 import torch
 from torch import nn as nn
 
+import numpy as np
+from sklearn.utils.class_weight import compute_class_weight
+
+def get_class_weight(dataset, method='balanced'):
+    """
+    Compute class weights from dataset statistics using sklearn
+    
+    Args:
+        dataset: Your dataset object
+        method: 'balanced' or 'balanced_subsample'
+    """    
+    # Collect all labels from dataset
+    all_labels = []
+    
+    for i in range(len(dataset)):
+        _, label = dataset[i]
+        
+        if label.dim() == 1:  # 1D tensor of phoneme IDs (mixed format without batching)
+            # Each element is a phoneme ID for that frame
+            all_labels.extend(label.numpy())
+        else:
+            raise ValueError(f"Unexpected label shape: {label.shape}. Expected 1D tensor from unbatched dataset.")
+    
+    all_labels = np.array(all_labels)
+    unique_classes = np.unique(all_labels)
+    
+    # Compute class weights using sklearn
+    if method in ['balanced', 'balanced_subsample']:
+        class_weights_array = compute_class_weight(
+            class_weight=method,
+            classes=unique_classes,
+            y=all_labels
+        )
+    else:
+        raise ValueError(f"Unknown method: {method}. Use 'balanced' or 'balanced_subsample'")
+    
+    # Convert to torch tensor, ensuring all classes are represented
+    weights = torch.ones(dataset.n_attrs)  # Default weight of 1.0
+    weights[unique_classes] = torch.from_numpy(class_weights_array).float()
+    
+    return weights
+
 class AdaptiveNorm2d(nn.Module):
     """
     Adaptive Instance Normalization that learns different normalization 
