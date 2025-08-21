@@ -186,8 +186,8 @@ class mspVAETrainer:
                 fake = discr(prod.detach())
                 loss_fake = discr.loss(fake, torch.zeros_like(fake))
 
-                discr_loss = loss_real + loss_fake
-                discr_loss.sum().backward()
+                discr_loss = (loss_real + loss_fake).sum()
+                discr_loss.backward()
                 
                 # Add gradient clipping for discriminators
                 if hasattr(self.config, 'disc_grad_clip_norm') and self.config.disc_grad_clip_norm > 0:
@@ -515,7 +515,8 @@ class mspVAETrainer:
         
         num_epochs = getattr(self.config, 'num_epochs', 100)
         print(f"Starting training for {num_epochs} epochs (from epoch {start_epoch})")
-        
+        do_early_stop: bool = False
+
         for epoch in range(start_epoch, num_epochs):
             self.epoch = epoch
             
@@ -552,8 +553,8 @@ class mspVAETrainer:
                 if do_stop:
                     print(f"Early stopping triggered at epoch {epoch}")
                     print(f"Status: {self.early_stop.get_status()}")
-                    break
-                
+                    do_early_stop = True
+
             if self.scheduler:
                 if self.config.scheduler_type == 'plateau':
                     monitor_loss = val_epoch_losses.get(self.scheduler_monitor_loss, train_epoch_losses[self.scheduler_monitor_loss])
@@ -610,13 +611,16 @@ class mspVAETrainer:
             
             # Visualize reconstructions periodically
             vis_interval = getattr(self.config, 'vis_interval', 10)
-            if val_loader and (epoch + 1) % vis_interval == 0:
+            if val_loader and (do_early_stop or (epoch + 1) % vis_interval == 0):
                 self.visualize_reconstructions(val_loader)
             
             # Plot losses periodically
             plot_interval = getattr(self.config, 'plot_interval', 10)
-            if (epoch + 1) % plot_interval == 0:
+            if do_early_stop or (epoch + 1) % plot_interval == 0:
                 self.plot_losses()
+
+            if do_early_stop:
+                break
         
         print(f'\nTraining completed! Best loss: {self.best_loss:.4f}')
         print(f'Model saved to: {self.model_dir}')

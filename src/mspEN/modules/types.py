@@ -45,7 +45,15 @@ class TrainingConfig:
 VAEOutType = Tuple[Tensor, Tensor, Tensor, Tensor]
 class VAEType(nn.Module, ABC):
     def __call__(self, x: Tensor) -> VAEOutType:
-        return cast(VAEOutType, super().__call__(x))   
+        return cast(VAEOutType, super().__call__(x))
+    
+    @abstractmethod
+    def encode(self, x: Tensor) -> torch.Tensor:
+        '''Encode data into latent representation'''
+
+    @abstractmethod
+    def decode(self, z: Tensor) -> torch.Tensor:
+        '''Decode data back'''
 
     @abstractmethod
     def update_hyperparameters(self, epoch: int) -> None:

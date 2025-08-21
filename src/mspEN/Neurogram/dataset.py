@@ -7,7 +7,6 @@ from pathlib import Path
 
 import torch
 from torch.utils.data import Dataset, DataLoader, Subset
-from sklearn.utils import compute_class_weight
 from sklearn.model_selection import train_test_split
 
 Indices = Sequence[Tuple[int, int]]
@@ -23,15 +22,15 @@ class NeurogramDataset(Dataset):
     """
     def __init__(
         self,
-        neurogram:  NDArray[np.float32],          # [N_time, F]
-        phoneme: NDArray[np.int8],           # [N_time] ints in {0..39}
+        neurogram:  NDArray[np.float32],
+        phoneme: NDArray[np.int8],
         stream_idx: NDArray[np.int32] | None = None,
         
         strategy: str = 'centered',
 
         n_attrs: int = 40,
         val_split: float = 0.2,
-        time_dim: int = 50,
+        time_dim: int = 100,
         hop: int | None = None,
     ):
         assert len(set(phoneme)) <= n_attrs, "got more phoneme than expected"
@@ -205,7 +204,7 @@ def make_loader(
     
     n_attrs: int = 40,
     val_split: float = 0.2,
-    time_dim: int = 50,
+    time_dim: int = 100,
     hop: int | None = None,
 
     batch_size: int = 60,
