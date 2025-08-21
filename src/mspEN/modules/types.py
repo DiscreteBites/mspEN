@@ -48,7 +48,7 @@ class VAEType(nn.Module, ABC):
         return cast(VAEOutType, super().__call__(x))
     
     @abstractmethod
-    def encode(self, x: Tensor) -> torch.Tensor:
+    def encode(self, x: Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         '''Encode data into latent representation'''
 
     @abstractmethod

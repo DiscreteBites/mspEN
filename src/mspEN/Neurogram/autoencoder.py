@@ -124,20 +124,19 @@ class NeurogramVAE(VAEType):
         eps = torch.randn_like(std)
         return mu + eps*std
     
-    def encode(self, x: torch.Tensor) -> torch.Tensor:
+    def encode(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         h = self.encoder(x)
         mu = self.fc1(h)
         logvar = self.fc2(h)
         z = self.reparameterize(mu, logvar)
-        return z
+        return z, mu, logvar
     
     def decode(self, z: torch.Tensor) -> torch.Tensor:
         prod = self.decoder(z)
         return prod
     
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        mu, logvar = self.encode(x)
-        z = self.reparameterize(mu, logvar)
+        z, mu, logvar = self.encode(x)
         prod = self.decoder(z)
         return prod, z, mu, logvar
     
